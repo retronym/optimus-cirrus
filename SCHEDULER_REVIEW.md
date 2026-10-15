@@ -6,7 +6,7 @@ Severity key: **H** likely to bite in production, **M** real but needs specific 
 
 ## Races and correctness
 
-### R1 (M) Causality packs the thread id into 16 bits and overflows
+### R1 (H, permanent hang demonstrated end to end) Causality packs the thread id into 16 bits and overflows
 
 `NodeTask.setCausality` (NodeTask.java:198) stores `(causality & 0xFFFF) | (threadID << 16)` and `causalityThreadID()` (line 194) recovers it with an arithmetic `>> 16`. `threadID` comes from `OGScheduler.threadCounter`, which is bumped for every injected worker **and** every `newEvaluationContext` call (OGScheduler.java:490), i.e. every thread that ever initialises an `EvaluationContext`. Idle worker contexts are reused, but user threads are not: a server whose request pool churns threads, or a long test run, will pass 32,767 ids.
 
@@ -14,11 +14,15 @@ Severity key: **H** likely to bite in production, **M** real but needs specific 
 - From id 65,536 the shift wraps completely and ids alias. `canTake` then lets thread N take work stamped by thread N+65536 under a sync stack, which is exactly the sync-stack deadlock the causality check exists to prevent.
 - `poisonCausality` (line 205) uses `Integer.MAX_VALUE << 16`, which extracts as thread id -1. Works by accident.
 
+Tier 1 probe T1 ran the real scheduler with `threadCounter` primed to 32,768 and 65,530. Every re-enqueue from a causality > 0 frame is then refused by its own thread (100% vs 0–1% at baseline) and lands on the global queue. Shapes where the refused node stays on the waiting thread's forward chain still finish at baseline speed, because `wait()`'s chain walk hands it back. A shape where it does not (a sync node whose fan-in awaiter registers on all children, so siblings are off the chain) hangs permanently: runnable nodes sit in the global quick queue, every thread is in `waitThreads`, `workThreads` is empty, idle workers stay parked, and the 1 s deadlock timer never recovers it because it only walks forward chains. `ideal=1` hangs every time; `ideal=2` with 4 clients hangs in 1–3 of 3 runs. So this is not timer-paced slowness but a deadlock, reached by nothing more than enough threads having initialised an `EvaluationContext` over the process lifetime.
+
 Fix: widen `_causality` to a `long` (the field is transient and already padded by the volatile `_state` neighbour), or mask with `>>> 16` and assert/saturate at 0xFFFF in `injectThread`/`newEvaluationContext`.
 
 ### R2 (M) `WorkQueue` index reset breaks sync-frame markers
 
 `OGSchedulerContext.WorkQueue` compares `_top` and `_base` directly (`_top <= _base` at line 372, `top < _base` at 413 and 426, `(top - base) >= mask` at 442) and relies on `resetBounds` (455) firing exactly when `_top == Integer.MAX_VALUE` (452). The reset itself is sound (probe W1a) and tasks are not lost across it (W1s). The problem is state held outside the queue: a sync frame that captured `currentLocalQueueMarker = localQ.getTop()` before the reset (OGSchedulerContext.java:744) now holds a marker larger than any future `_top`, so `localPop(queueMarker)` returns null for the rest of that frame (demonstrated by W1b). The thread cannot drain its own local queue and depends on thieves or the deadlock timer. The growArray comment ("we cannot move _top because of causality mark") shows this was known for the resize case but not the reset case.
+
+Tier 1 probe T2 confirms it on the real scheduler: with the thread's local queue primed at `MAX_VALUE - 10`, a root that enqueues four fan-outs and `runAndWait`s them captures a marker of `MAX_VALUE - 6`, the sixth push fires the reset (`top=257 base=53`), and the owner is fenced off its own 200 tasks. With `ideal=1` the run hangs (1 of 800 leaves run before the 20 s watchdog); with `ideal=2` it completes in normal time but the owner runs 1 of 800 leaves instead of 200, a thief does the rest.
 
 A second case I reported in the first draft, `_base` passing `MAX_VALUE` via the "+1 overrun" state described in the class comment, is withdrawn: probe W1a' could not produce `base > top` in 20,000 pop-vs-steal races. The comment describes an older `localPop` that did not CAS; the current one does, so the overrun state is unreachable and the reset guard is always hit.
 
@@ -52,7 +56,11 @@ These are deliberate ("we are probably heading for a bad deadlock"), but the sur
 
 ### F2 Mutating the callback set from `checkForNewWork` throws CME → panic
 
-`runOnStalledCallbacks` iterates `_onStalledCallbacks` with for-each while calling `checkForNewWork` (OGScheduler.java:1475). `_lock` is reentrant, so a callback that adds or removes a listener from inside `checkForNewWork` gets `ConcurrentModificationException` from the `PriorityQueue` iterator. Only `onGraphStalled` has the pending-list protection. The exception propagates out of `findWork` into `wait` and panics.
+`runOnStalledCallbacks` iterates `_onStalledCallbacks` with for-each while calling `checkForNewWork` (OGScheduler.java:1475). `_lock` is reentrant, so a callback that adds or removes a listener from inside `checkForNewWork` gets `ConcurrentModificationException` from the `PriorityQueue` iterator. Only `onGraphStalled` has the pending-list protection. Tier 1 probe T8 shows the exception on the real stall path is raised on the spinning worker (`findWork` ← `spin` ← `OGLogicalThread.run`), not in `wait()`, and goes to `panic(66)`; the CME itself is never logged (visible only with `-Xlog:exceptions=info`).
+
+### F2b (M) A worker that dies in `panic` stays registered, turning a failed kill into a permanent hang
+
+Found by T8. When `panic` (and therefore `InfoDumper.graphPanic`) throws instead of exiting, the `OGLogicalThread` unwinds and the platform thread ends, but its `Context` is never removed from `_workers`. The status dump afterwards shows `workThreads 1 [og.worker-1-3]` for a thread that no longer exists, so `_workers.count` never reaches 0, the stalled-callback recovery in `fullWait` never fires, and the client parks forever. Same root cause as F1b: the kill paths assume `graphPanic` cannot throw. `OGLogicalThread.run` should remove its context (an `exitGraph`-style cleanup in a `finally`) before the thread dies, and the last resort after a failed `graphPanic` should be `Runtime.halt`.
 
 ### F3 Unbounded thread injection
 
@@ -177,6 +185,19 @@ The three remaining `WorkQueue` probes ran with the P3 delay-injection agent (`p
 | W1c | pop vs steal, one element | **demonstrated** (stale return, no loss) | Schedule `A1 B1 B2 A2`: the thief takes T1 and bumps `_base`; the owner's CAS fails but `localPop` still returns T1 and leaves `_top` undecremented. Final `top=11 base=11`, consistent. The task is handed out twice; only the `tryRun` CAS prevents a double run. |
 | W1d | grow vs steal | not reproduced (resurrection noted) | No task dropped in any of the 6 schedules and `_base` after the swap is never below what the thief read. But in 3 schedules the thief steals T0 from the old array after the copy loop has already copied it, and the swap then writes `_base = 0`: the stolen task is live again at the bottom of the new array (double dispatch). The class comment allows this; anything that reads `size()` as a count of pending work (`checkNewWorkAdded`, `hasEnoughWork`) sees a phantom. |
 | W1e | scan vs steal | **demonstrated** (double hand-out, no loss, no hole) | Thread 7, causality 2, one matching task M at the steal end: in 4 of 6 schedules `scanToFindWork` returns M and `tryToSteal` also returns M. `removeAt` sees `index < _base` and does nothing, but `scanToFindWork` returns its earlier unsynchronised read anyway. Final `top=13 base=11`, `[T1, T2]` left. With M in the middle every schedule is clean. |
+
+## Tier 1 probe results
+
+End-to-end runs of the real scheduler in child JVMs, `probes/run-tier1.sh` (about five minutes; per-child logs with `TIER1_LOGDIR`). Summary and raw output in `probes/RESULTS-tier1.txt`.
+
+| Probe | Hazard | Outcome | What was observed |
+|-------|--------|---------|-------------------|
+| T1 | R1 | **demonstrated: permanent hang** | Details under R1. Refused re-enqueues 100% at ids ≥ 32,768; "fan" shape deadlocks with runnable work on the global queue and all threads waiting; `ideal=1` every run, `ideal=2`/4 clients 1–3 of 3. At 65,536 one client does not hang because the id aliases to 0, which `canTake` treats as unowned. |
+| T2 | R2 | **demonstrated** | Details under R2. Owner fenced off its own queue after the reset; hang at `ideal=1`, thief-carried at `ideal=2`. |
+| T7 | F1/F1b | **demonstrated** (exit 0, not 121) | Node completes then throws → "Cannot complete node twice" → `logAndDie` → `InfoDumper.<clinit>` throws → recursion guard returns → JVM continues with `inLogAndDie = true`. A later unrelated double completion produces one "called recursively" line, no dump, no exit. |
+| T8 | F2/F2b | **demonstrated** (hang, not exit 66) | 2–3 self-removing listeners: CME on the spinning worker → `panic` → `InfoDumper` throws → worker thread dies but stays in `_workers` → client parks until the watchdog. One self-remover: no CME, completes. |
+
+One more observation from T1 worth its own line: with `limitThreads` (the default), a thread moving to `_waiters` does not wake an idle worker (`nextStepForWorkingThread` only does `drainTo` + `addWorkerIfNeeded` under `!limitThreads`), and `addWorkerIfNeeded` counts waiters against the ideal. The design relies on waiting threads finding global work themselves via `canTake`; anything that makes `canTake` lie (R1) therefore leaves runnable work on the global queue with parked idle threads next to it. A periodic "runnable work on the global queue and no worker" check in `fullWait`'s timer branch would turn this class of deadlock into a stall.
 
 ### R7 (L) Three paths return a task after the write that should have confirmed it was taken fails
 
