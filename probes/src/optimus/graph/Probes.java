@@ -357,6 +357,9 @@ public final class Probes {
     results.add(run("W1a", Probes::w1a));
     results.add(run("W1a'", Probes::w1aPrime));
     results.add(run("W1b", Probes::w1b));
+    results.add(run("W1c", Probes3::w1c));
+    results.add(run("W1d", Probes3::w1d));
+    results.add(run("W1e", Probes3::w1e));
     results.add(run("W1f", Probes::w1f));
     results.add(run("W1s", Probes::w1s));
     results.add(run("W3d", Probes::w3d));

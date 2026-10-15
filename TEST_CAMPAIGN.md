@@ -153,8 +153,8 @@ A 24 h run of H3 scenarios in a loop on a 4-core box with `threadCounter` and `_
 - Build: done (see SCHEDULER_REVIEW.md "Build and run"). Probes run in-process with `-javaagent`; `probes/run.sh` in the worktree compiles and runs them.
 - Step harness `probes/src/probes/Steps.java`: done.
 - Tier 0: every probe that needs no delay injection has run (`probes/RESULTS.txt`). Results and amendments in SCHEDULER_REVIEW.md "Tier 0 probe results". Demonstrated: W1b, W1f, W2a, W2b, W3c (as new F1b), W3d, W3e, W3f, W4a, W5a, W5d, W6c. Not reproduced or quantified: the rest. Withdrawn/downgraded: R2 base-overrun case, F4, I1, I3.
-- Remaining Tier 0: W1c, W1d, W1e (need P3).
-- Next: P3 delay injection, then Tier 1 (T1, T2, T7, T8 first), then H1/H2.
+- P3 delay injection: done (ASM agent, `probes/src/probes/DelayAgent.java`, armed per thread via `Delay.arm(ctl, ids...)`, or random parks via `-Dprobes.delay.maxNanos=N` for hunter runs). W1c–e run: W1c and W1e demonstrated (stale returns), W1d not reproduced (resurrection noted). Tier 0 complete.
+- Tier 1 T1, T2, T7, T8: in progress. Next: H1/H2, then H3 with the random-delay mode.
 
 ## Open questions
 

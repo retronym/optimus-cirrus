@@ -34,6 +34,18 @@ public final class Steps {
       stepsTaken++;
       owner.await(id, stepsTaken);
     }
+
+    public int stepsTaken() {
+      return stepsTaken;
+    }
+
+    /**
+     * Take steps until n have been taken. Lets a participant that returned early (e.g. found the
+     * queue empty) still consume the steps the schedule names for it, so every permutation runs.
+     */
+    public void padTo(int n) {
+      while (stepsTaken < n) step();
+    }
   }
 
   private final List<Consumer<Ctl>> participants = new ArrayList<>();

@@ -170,7 +170,17 @@ Probes live in the scratchpad `probes/` directory (`run.sh` compiles and runs th
 | W6e | I3 thread start under lock | not reproduced (quantified) | `enqueue()` holding `_lock`: median 28 µs when it must create a platform thread vs 12.5 µs when it unparks an idle one, on this Mac. Real but smaller than I guessed; I3 downgraded. |
 | W7 | I1 wait entry cost | quantified | Median cross-thread blocking wait 29 µs; the unconditional `toString` + `new Exception` cost 0.25 µs on this trivial node with a shallow stack. Negligible here; only matters for nodes with expensive pretty-printing or deep stacks. I1 downgraded. |
 
-Not yet run (need delay injection inside `WorkQueue` methods, P3 in the campaign): W1c, W1d, W1e.
+The three remaining `WorkQueue` probes ran with the P3 delay-injection agent (`probes/src/probes/DelayAgent.java`, an ASM load-time transformer that inserts `probes.Delay.point(id)` after the slot reads and before the CAS/swap/removeAt in `tryToSteal`, `localPop`, `tryLocalPop`, `growArray` and `scanToFindWork`; the step harness then drives those points, so every interleaving of two threads × two steps is enumerated against the real class):
+
+| Probe | Hazard | Outcome | What was observed |
+|-------|--------|---------|-------------------|
+| W1c | pop vs steal, one element | **demonstrated** (stale return, no loss) | Schedule `A1 B1 B2 A2`: the thief takes T1 and bumps `_base`; the owner's CAS fails but `localPop` still returns T1 and leaves `_top` undecremented. Final `top=11 base=11`, consistent. The task is handed out twice; only the `tryRun` CAS prevents a double run. |
+| W1d | grow vs steal | not reproduced (resurrection noted) | No task dropped in any of the 6 schedules and `_base` after the swap is never below what the thief read. But in 3 schedules the thief steals T0 from the old array after the copy loop has already copied it, and the swap then writes `_base = 0`: the stolen task is live again at the bottom of the new array (double dispatch). The class comment allows this; anything that reads `size()` as a count of pending work (`checkNewWorkAdded`, `hasEnoughWork`) sees a phantom. |
+| W1e | scan vs steal | **demonstrated** (double hand-out, no loss, no hole) | Thread 7, causality 2, one matching task M at the steal end: in 4 of 6 schedules `scanToFindWork` returns M and `tryToSteal` also returns M. `removeAt` sees `index < _base` and does nothing, but `scanToFindWork` returns its earlier unsynchronised read anyway. Final `top=13 base=11`, `[T1, T2]` left. With M in the middle every schedule is clean. |
+
+### R7 (L) Three paths return a task after the write that should have confirmed it was taken fails
+
+`localPop` (OGSchedulerContext.java:410–421) returns `r` even when its CAS failed; `scanToFindWork` (line 566 onward) returns `t` even when `removeAt` found `_base` already past it; `growArray` (line 466 onward) copies slots a thief is concurrently emptying and then resets `_base` below the thief's bump. All three are known to the authors ("tasks can be on more than one queue at a time") and are safe only because `OGSchedulerContext.run` CASes `STATE_NOT_RUNNABLE` before running. Worth stating that invariant as a comment on each site and asserting it under `schedulerAsserts` (a task returned twice must fail the second `tryRun`); and `size()` should not be used as a pending-work count anywhere that matters.
 
 ### F1b (M) A failed kill is swallowed, and the guard then disables every later kill
 
