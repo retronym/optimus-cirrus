@@ -68,14 +68,14 @@ stateDiagram-v2
     HALF: DONE_FLAG only<br/>isDone() false, isRunnable() true
 
     [*] --> NEW
-    NEW --> RUNNING: tryRun() wins the CAS
-    RUNNABLE --> RUNNING: tryRun() wins the CAS
-    RUNNING --> RUNNABLE: onChildCompleted → markAsRunnable (suspended, child done)
-    RUNNING --> DONE: complete() / completeWithException()
-    DONE --> INVALID: invalidateCache() (cache/tracker, no notify)
-    INVALID --> DONE: complete() (waiters still registered)
-    DONE --> HALF: markAsRunnable() racing complete() (R8)
-    HALF --> RUNNING: tryRun() wins again → run() twice → logAndDie
+    NEW --> RUNNING: tryRun wins the CAS
+    RUNNABLE --> RUNNING: tryRun wins the CAS
+    RUNNING --> RUNNABLE: onChildCompleted → markAsRunnable suspended, child done
+    RUNNING --> DONE: complete / completeWithException
+    DONE --> INVALID: invalidateCache cache/tracker, no notify
+    INVALID --> DONE: complete waiters still registered
+    DONE --> HALF: markAsRunnable racing complete R8
+    HALF --> RUNNING: tryRun wins again → run twice → logAndDie
     DONE --> [*]
     note right of DONE
         "done" needs two bits.
@@ -139,13 +139,13 @@ stateDiagram-v2
 
     [*] --> null
     null --> single: tryAddToWaiterList CAS
-    single --> list: tryAddToWaiterList CAS<br/>(wrap + cons)
-    list --> list: tryAddToWaiterList CAS<br/>continueWithLast: rebuild O(n)
+    single --> list: tryAddToWaiterList CAS wrap + cons
+    list --> list: tryAddToWaiterList CAS continueWithLast: rebuild On
     null --> completed: notifyWaiters swap
-    single --> completed: notifyWaiters swap,<br/>then call the one waiter
-    list --> completed: notifyWaiters swap,<br/>then walk and call each
-    completed --> completed: tryAddToWaiterList returns false<br/>→ caller invokes callback itself
-    completed --> null: reset() (clone / re-run; not thread safe)
+    single --> completed: notifyWaiters swap, then call the one waiter
+    list --> completed: notifyWaiters swap, then walk and call each
+    completed --> completed: tryAddToWaiterList returns false → caller invokes callback itself
+    completed --> null: reset clone / re-run, not thread safe
 ```
 
 **Parallels.** `CompletableFuture`'s Treiber stack of `Completion` nodes with the `null`/stack/done states; `AbstractQueuedSynchronizer`'s CLH queue; JavaScript promise reaction lists. The exactly-once-via-CAS contract is the same one as in `CompletableFuture.uniPush`.
@@ -274,17 +274,17 @@ stateDiagram-v2
     dead: thread gone
 
     [*] --> outside
-    outside --> workers: enterGraph (first runAndWait on this thread)
-    workers --> outside: exitGraph (sync stack empty again)
-    workers --> waiters: nextStepForWorkingThread: no work, awaitTask != null<br/>parked = true
-    waiters --> workers: tryWakeupThread (enqueue handed me a task,<br/>or my awaited node completed) parked = false, unpark
+    outside --> workers: enterGraph first runAndWait on this thread
+    workers --> outside: exitGraph sync stack empty again
+    workers --> waiters: nextStepForWorkingThread: no work, awaitTask != null parked = true
+    waiters --> workers: tryWakeupThread enqueue handed me a task, or my awaited node completed parked = false, unpark
     waiters --> workers: deadlock timer found runnable work on my chain
-    workers --> idle: nextStepForWorkingThread: no work, helper,<br/>idle.count < 2×ideal
-    idle --> workers: injectThread (addWorkerIfNeeded / evaluateOnGraphThread…)<br/>becomes the spinner
-    workers --> dead: nextStepForWorkingThread: idle pool full, or shutdown<br/>ctx.shutdown = true
-    workers --> blocked: doBlockingAction → exitGraph(externallyBlocked)
-    blocked --> workers: enterGraph(wasExternallyBlocked)
-    workers --> dead: panic() (thread dies, Context NOT removed: F2b)
+    workers --> idle: nextStepForWorkingThread: no work, helper, idle.count < 2×ideal
+    idle --> workers: injectThread addWorkerIfNeeded / evaluateOnGraphThread... becomes the spinner
+    workers --> dead: nextStepForWorkingThread: idle pool full, or shutdown ctx.shutdown = true
+    workers --> blocked: doBlockingAction → exitGraphexternallyBlocked
+    blocked --> workers: enterGraphwasExternallyBlocked
+    workers --> dead: panic thread dies, Context NOT removed: F2b
     note right of waiters
         Under limitThreads, waiters count
         against the ideal in addWorkerIfNeeded.

@@ -347,9 +347,9 @@ stateDiagram-v2
     hang: permanent hang
 
     [*] --> work: evaluateNodeAsync / SEQ re-enqueue from non-graph thread
-    work --> waiting: enqueue: canTake(K, ctx, depth≥1) false for every waiter
+    work --> waiting: enqueue: canTakeK, ctx, depth≥1 false for every waiter
     waiting --> idle: addWorkerIfNeeded: workers + waiters ≥ ideal → no injection
-    idle --> hang: nothing re-checks the global queue on move-to-waiters / exitGraph;<br/>1 s timer only walks forward chains
+    idle --> hang: nothing re-checks the global queue on move-to-waiters / exitGraph, 1 s timer only walks forward chains
     note right of hang
         limitThreads=false never hangs:
         a causality-0 spinner always exists.

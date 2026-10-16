@@ -832,7 +832,7 @@ public final class Hunter {
 
   static int stallDumps;
 
-  static void snapshot(G g, OGScheduler s, String why, long waitedMs, boolean fatal) {
+  static String snapshot(G g, OGScheduler s, String why, long waitedMs, boolean fatal) {
     System.out.println((fatal ? "CHILD-HANG " : "STALL-DUMP ") + why + " after " + waitedMs + " ms");
     StringBuilder cls = new StringBuilder();
     try {
@@ -955,6 +955,7 @@ public final class Hunter {
     System.out.println((fatal ? "HANG-CLASS " : "STALL-CLASS ") + cls.toString().trim().replace(' ', '+'));
     System.out.flush();
     if (fatal) Runtime.getRuntime().halt(3);
+    return cls.toString().trim().replace(' ', '+');
   }
 
   // ================================================================== child
@@ -1297,6 +1298,19 @@ public final class Hunter {
     return m;
   }
 
+  static long leakedClients;
+  static boolean hungSeed;
+  static final java.lang.reflect.Method M_INJECT;
+
+  static {
+    try {
+      M_INJECT = OGScheduler.class.getDeclaredMethod("injectThread", NodeTask.class);
+      M_INJECT.setAccessible(true);
+    } catch (Exception e) {
+      throw new RuntimeException(e);
+    }
+  }
+
   static void soakChild(long firstSeed, String cfg, long durationSec) throws Exception {
     long wdMs = Long.getLong("hunter.wdMs", 10_000);
     long budgetMs = Long.getLong("hunter.budgetMs", 2000);
@@ -1320,7 +1334,8 @@ public final class Hunter {
     long t0 = System.nanoTime(), lastStat = 0;
     for (long seed = firstSeed; (System.nanoTime() - t0) / 1_000_000_000L < durationSec; seed++) {
       Spec sp = generate(seed, 0);
-      int f0 = findingCount.get();
+      findingCount.set(0); // the 200-line cap applies per seed here
+      int f0 = 0;
       findings.clear();
       // fresh client threads for every seed: a request pool that churns threads (each one initialises an
       // EvaluationContext and takes a new id from threadCounter, as production threads do)
@@ -1354,6 +1369,7 @@ public final class Hunter {
         clients.add(t);
       }
       long ts0 = System.nanoTime(), maxMs = 0;
+      boolean rescuedSeed = false;
       int iter;
       List<String> h5 = new ArrayList<>();
       for (iter = 0; iter < maxIters; iter++) {
@@ -1374,12 +1390,31 @@ public final class Hunter {
           qs.get(c).put(new Job(g, sp.clientRoot[c], done));
         }
         if (!done.await(wdMs, TimeUnit.MILLISECONDS)) {
-          snapshot(g, s, "soak seed " + seed + " clients not done (iter " + iter + ")", wdMs, false);
-
-          System.out.println("SOAK-RESULT seed=" + seed + " class=HANG iters=" + iter + " findings=" + String.join(",", findingKinds()));
+          String hc = snapshot(g, s, "soak seed " + seed + " clients not done (iter " + iter + ")", wdMs, false);
+          // Rescue attempt = R10's fix direction: inject one causality-0 worker above the ideal count. A
+          // causality stall recovers; a sync-stack deadlock (R9) does not, its clients are abandoned.
+          synchronized (F_LOCK.get(s)) {
+            M_INJECT.invoke(s, (Object) null);
+          }
+          boolean rescued = done.await(5, TimeUnit.SECONDS);
+          long left = done.getCount();
+          if (!rescued) leakedClients += left;
+          System.out.println("SOAK-RESULT seed=" + seed + " class=" + (rescued ? "HANG-RESCUED:" : "HANG:") + hc + " iters=" + iter + " abandonedClients=" + (rescued ? 0 : left)
+              + " leakedTotal=" + leakedClients + " findings=" + String.join(",", findingKinds()));
           soakStat(s, sid, t0, seed, true);
           System.out.flush();
-          Runtime.getRuntime().halt(3);
+          if (leakedClients > Integer.getInteger("hunter.soakMaxLeaked", 4)) {
+            System.out.println("SOAK-RESTART leakedClients=" + leakedClients);
+            System.out.flush();
+            Runtime.getRuntime().halt(3);
+          }
+          if (!rescued) {
+            hungSeed = true;
+            break;
+          }
+          checkGraph(g);
+          rescuedSeed = true;
+          break; // next seed (the same seed would stall again every iteration)
         }
         maxMs = Math.max(maxMs, (System.nanoTime() - ts) / 1_000_000);
         for (ScheduledFuture<?> f : cancels)
@@ -1404,11 +1439,15 @@ public final class Hunter {
         }
       }
       for (Thread t : clients) t.interrupt();
-      for (Thread t : clients) t.join(2000);
+      if (!hungSeed) for (Thread t : clients) t.join(2000);
       HunterH4.purge();
+      if (hungSeed) {
+        hungSeed = false;
+        continue;
+      }
       List<String> fk = findingKinds();
       boolean oracle = fk.stream().anyMatch(k -> !k.equals("H5") && !k.equals("SLOW_ITER") && !k.equals("TIMER_RECOVERED_LOST_WAKEUP"));
-      String cls = oracle ? "ORACLE" : fk.contains("H5") ? "H5" : maxMs >= 900 ? "PASS-SLOW" : "PASS";
+      String cls = rescuedSeed ? "RESCUED-SEED" : oracle ? "ORACLE" : fk.contains("H5") ? "H5" : maxMs >= 900 ? "PASS-SLOW" : "PASS";
       System.out.println("SOAK-RESULT seed=" + seed + " class=" + cls + " iters=" + iter + " maxIterMs=" + maxMs + " N=" + sp.n + " clients=" + sp.clients
           + " findings=" + String.join(",", fk) + " newFindings=" + (findingCount.get() - f0));
       if ((System.nanoTime() - t0) / 1_000_000_000L - lastStat >= 30) {
@@ -1491,8 +1530,8 @@ public final class Hunter {
                   lastSeed = Long.parseLong(kv.get("seed"));
                   String c = kv.get("class");
                   synchronized (cur) {
-                    cur.counts[c.startsWith("PASS") ? 0 : c.equals("HANG") ? 1 : 2]++;
-                    cur.cls.merge(c + (c.equals("PASS") ? "" : "{" + kv.get("findings") + "}"), 1, Integer::sum);
+                    cur.counts[c.startsWith("PASS") ? 0 : c.startsWith("HANG:") ? 1 : c.startsWith("HANG-RESCUED") ? 3 : 2]++;
+                    cur.cls.merge(c + (c.startsWith("PASS") || kv.get("findings") == null || kv.get("findings").isEmpty() ? "" : "{" + kv.get("findings") + "}"), 1, Integer::sum);
                   }
                   synchronized (System.out) {
                     System.out.println("RESULT soak cfg=" + cfg + " seg=" + segment + " " + l.substring(12));
@@ -1514,7 +1553,6 @@ public final class Hunter {
             if (p.exitValue() != 0 && p.exitValue() != 3) synchronized (System.out) {
               System.out.println("EVENT soak cfg=" + cfg + " seg=" + segment + " exit=" + p.exitValue());
             }
-            if (p.exitValue() == 3) lastSeed++; // the hung seed reported its own SOAK-RESULT
             seed = Math.max(seed, lastSeed + 1);
             segment++;
           }
@@ -1545,7 +1583,7 @@ public final class Hunter {
         int[] c = (int[]) o.getClass().getMethod("counts").invoke(o);
         Object cls = o.getClass().getMethod("cls").invoke(o);
         String[] st = (String[]) o.getClass().getMethod("lastStat").invoke(o);
-        System.out.println("SOAK-WINDOW cfg=" + e.getKey() + " minutes=" + (wi * 10) + "-" + (wi * 10 + 10) + " pass=" + c[0] + " hang=" + c[1] + " other=" + c[2]
+        System.out.println("SOAK-WINDOW cfg=" + e.getKey() + " minutes=" + (wi * 10) + "-" + (wi * 10 + 10) + " pass=" + c[0] + " hang=" + c[1] + " hangRescued=" + c[3] + " other=" + c[2]
             + " classes=" + cls + " lastStat=[" + st[0] + "]");
       } catch (Exception x) {
         System.out.println("SOAK-WINDOW error " + x);
