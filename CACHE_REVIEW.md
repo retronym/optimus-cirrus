@@ -15,7 +15,7 @@ The candidates we would chase first, by expected impact:
 | R2 | H | The many-node async completion counter is attached to the caller's cancel scope; if that scope is cancelled first the counter is cancelled instead of run and the queue wedges. The single-node path already uses `constantNC` with a comment saying why. | ring4a A3 |
 | R3 | H | Cleanup triggered from inside `complete()` by the cleared-reference watermark takes `queueLock`, while the low-priority cancel path holds `queueLock` and waits for that very node to stop: deadlock, plus every graph thread crossing the watermark stalls meanwhile. | ring4b S2 |
 | D2 | M→H | The root-wide TTrack traversal id is a plain `var` whose contract ("only from root updates") concurrent child-tracker updates violate; equal ids make a marking traversal skip what the other marked, which is a lost invalidation on shared tracks. | ring4a A5, ring4b S4 |
-| D3 | M | `TPDMask.fromArray` truncates masks wider than the process's width instead of folding; an optconf `dependsOn` mask written by a wider process loses dependency bits, the unsafe direction for XSFT reuse. | ring1-2 S1 |
+| D3 | M, **demonstrated** | `TPDMask.fromArray` truncates masks wider than the process's width instead of folding; an optconf `dependsOn` mask written by a wider process loses dependency bits, the unsafe direction for XSFT reuse. The default width is 6 qwords in this build; under `tweakUsageQWords=2` (or 0) a 6-word mask decodes with its word-2 and word-5 bits gone and a property that depends on the word-2 bit reports "does not depend". | ring1-2 S1; W1 |
 | D4 | M | The SI stack is a copy of the root sharing its `_cacheID`; a non-SI node reached from an SI node that reads a never-tweaked tweakable caches an `IllegalScenarioDependenceException` (RT, so "usable") that later legal root lookups receive. | ring3 S1 |
 | D5 | M | `TweakExpander` calls `invalidateCache` on its own running node (impure translators, the default setting), so a concurrent sync waiter exits on `isDoneEx` and reads an incomplete result: the scheduler review's R6 mechanism, now with a production path. | ring4b S3 |
 | D6 | M | Nodes that write to a tracker's TTrack graph while an update runs (any evaluation under `tracker.scenarioStack` outside the queue, async-suspended orphans resuming) complete onto a detached or `Invalid` track and are cached stale forever, silently. | ring4b S1, S8; ring4a A4, A12 |
@@ -40,7 +40,7 @@ The candidates we would chase first, by expected impact:
 | P1 | M | `breakProxyChains` poisons the property's XSFT mask permanently on any batcher stall whose waiter chain contains an XSFT proxy; cycle recovery widens with the union over the whole cycle, permanently. | xsft.md Perf-M1/M2 |
 | P2 | M | A busy concurrent child queue self-approves work and drains its low-priority queue before releasing the parent; preemption does not reach into children; parent and root updates starve without bound. | ring4a A10 |
 
-Everything else is in the lens sections below.
+Everything else is in the lens sections below. Probe results so far are in "Phase 2 results" at the end; ids there refer to CACHE_CAMPAIGN.md.
 
 ## D: data loss and wrong results
 
@@ -56,8 +56,9 @@ Everything else is in the lens sections below.
 - **D10 (M, conditional)** Non-monotone `dependsOnTweakMask` writes from optconf (`setDependsOnMask`, NodeTaskInfo.java:668) after values are cached defeat the "mask only grows" premise of the XSFT fast path. Depends on whether config can be re-applied to live infos (hot-swap is parked).
 - **D11 (L)** Cleanup's `Nil`-middle-man bypass and `Invalid`-edge drop orphan tracks that a *held* completed node can still feed; needs a node object re-consumed across a cleanup. (4b S5)
 - **D12 (L)** `PtracksArray` resize: thread A CASes the last slot then plain-writes `nextFree`; B reads `nextFree` plainly and copies; no happens-before orders A's slot store before B's copy on weak memory models, so the copy can have a gap, after which callers past the gap are invisible to invalidation. jcstress candidate. (4b S9)
-- **D13 (L)** `Scenario.equals` is asymmetric across ordered/unordered; hash codes differ so the cache-id map will almost never compare them. (ring1-2 S7, ring3)
-- **D14 (L, latent)** `optimus.graph.cache.Interner` spins forever once an interned referent is collected and before the cleaner removes the holder (`compareAndSet(null, …)` against a never-null reference). Unused in this export. (ring1-2 S8)
+- **D13 (L→M, demonstrated)** `Scenario.equals` is asymmetric across ordered/unordered and the hash codes differ, so ordered and unordered scenarios never share a cache id (W5: ids 5 vs 6). But two *unordered* scenarios with the same duplicate-target tweaks in different orders do share one (`unordered(t1,t2)` equals `unordered(t2,t1)`, same hash), and resolution within a scenario is last-one-wins, so the second stack resolves the key to whichever tweak the first stack's cache id installed: `(t2,t1)` resolves k to 2 where its own order says 1. Reachable only through `resolveDupsByTakingLast` (plain `unordered` throws on duplicates). (ring1-2 S7, ring3; W5)
+- **D14 (L, latent, demonstrated)** `optimus.graph.cache.Interner` spins forever in `Holder.internedValueOr` (`compareAndSet(null, …)` against a never-null reference). The path I predicted (hash lookup after the referent is collected) does not spin: the stale `HashLookup` no longer equals the new one and a fresh holder is built. The identity path does: intern `w`, then `intern(o)` for an equal but distinct `o` (its identity entry maps to `w`'s holder), drop `w`, let it be collected; `intern(o)` now spins with the cleaner running, since the cleaner removes `w`'s entries but not `o`'s. Unused in this export, so still L. (ring1-2 S8; W12)
+- **D15 (M, new, W14)** `CleanupVisitor` makes a live node unreachable when an `Invalid` track has a non-`Invalid` caller. Minimal graph: root 0 → 1, 0 → 2, 1 → 2, track 1 `Invalid`, track 2 live. Cleanup drops the direct 0 → 2 edge as redundant (reachable via 1), then drops 0 → 1 because 1 is `Invalid`; node 2 is unreachable and root 0 is removed from the map. Exhaustive enumeration: 0 violations in 108 M instances over 21,479 graphs where every caller of an `Invalid` track is `Invalid` (the redundant-edge id algorithm itself held in every case), 524 k violations in 8.2 M instances once that precondition is broken. The precondition is a caller attached after invalidation, i.e. the D6 barrier hole, so D15 is the cleanup-time amplifier of D6: a node that was reachable directly becomes a silent stale hit. Fix: treat edges through an `Invalid` track as non-existent when deciding redundancy, or drop the redundant-edge pass for callers of `Invalid` tracks.
 
 ## R: races and deadlocks
 
@@ -81,7 +82,7 @@ Everything else is in the lens sections below.
 
 ## F: foot-guns
 
-- **F1–F7** as in the table (ring3 S5, S3, S4, S6; ring4b S7, S6; ring3 S12).
+- **F1–F7** as in the table (ring3 S5, S3, S4, S6; ring4b S7, S6; ring3 S12). W5 widens F1: tweaks differing only in `readsTweakables` or the `keepLazy` flags are `equals` too, and the `bindOnce` stack resolves `evaluateIn = 2` (bind's) while an `onlyReads` stack resolves `readsTweakables = null`; bound tweaks are not reducible to by-value, so `given`'s reduction does not hide it. W6 confirms F7 structurally: `(a:=1).nestWithFlatten(b:=a+1).nestWithFlatten(b:=5)` yields top `{a:=1, b:=5}` with nested `[{b:=a+1}]`, so b resolves to the by-name at the top, 2 (resolved through the cache ids, not by running a node); the public `onlyReads` also returns `this` for a by-name tweak. W7 confirms F2 and F3 with a precondition: a child of `ssShared.scenarioStack` with the same `SIParams` as the SI root loses all four flags in `asSiStack`; a child of the `initializeWithoutRuntime` stack keeps them only because its cancel scope differs. `S.withFlag(IGNORE_SYNC_STACKS).withCacheableTransitively` returns the previously upgraded stack without the flag, including the `TweakExpander` shape; set before the first upgrade, the flag survives.
 - **F8 (M)** Cache ids are shared across stacks that differ in anything but tweaks (plugin tags, node inputs, listener, cancel scope, flags): intended, because `PluginTagKey.affectsNodeResult` is `false` by contract, but a cacheable node that reads a tag is a silent wrong-reuse with no check anywhere. (ring1-2 S6)
 - **F9 (M)** `safeToEvaluate` increments a counter as a side effect inside an `Option.filter`; a missed `finishEvaluating` makes every later update spin forever. (4a)
 - **F10 (M)** Sync tracker API calls from graph threads block a scheduler thread on a latch without helping; a sync update under a sync stack trips OPTIMUS-43488; `track`/`trackUpdate`/`setPluginTag` bypass the queue; `executeBatchUpdateAsync` defaults to `Scheduler.currentOrDefault` against the reasoning in `DependencyTrackerAction.scala:111–115`. (4a)
@@ -129,3 +130,22 @@ From the cache: a singleton `NodeTaskInfo` (policies, masks and tweak ids hang o
 ## Testability (for Phase 2)
 
 Everything needed is in `core`: `EvaluationContext.initializeWithoutRuntime()`, `ScenarioStack.newRoot(minimal, uniqueID = true)`, `UNodeCache(name, size)`, `NodeScopedCache(size)`, `DependencyTrackerRoot()` with `newChildScenario(name, introduceConcurrentSubtree = …)`, `TEST_ONLY_disposeAllRoots()`, `FakeModuleEntity`, `SimpleValueTweak`, `TwkPropertyInfo0`, `NodeTaskInfo.TEST_ONLY_setAssumeDependsOn/TEST_ONLY_setTweakableID`, `NullScope`/`SimpleTrackingScope`, `TestEventCause()`. Instance tweaks need a non-null `Entity` (a probe class in `optimus.platform.storable` reaches `entityFlavorInternal`). Private members needed by reflection: `DependencyTrackerQueue.workQueue/lowPriorityQueue/_currentCancellationScope`, `root.traversalId`, cache ledgers. Delay hooks already in the code: `TESTABLE_FIXED_DELAY_CACHE/XS/XSFT`; the ASM agent pattern from the scheduler probes covers the rest.
+
+## Phase 2 results
+
+Probe code under `probes/cache/`; raw lines in `probes/cache/RESULTS-*.txt`. Build with `probes/cache/build.sh`, run with `probes/cache/run.sh <main>`; the fixture-free set with `probes/cache/run-whitebox0.sh`.
+
+### Fixtures and smoke
+
+`CacheFixturesSmoke` (100 checks) verified the hand-written nodes against the value oracle at the root, instance and property tweaks on a probe entity, by-name/bind/bindOnce/when resolution, cache-id sharing between equal sibling scenarios (one combinator run, hit under the second sibling), the tracker driver (invalidated sets matched the invalidation oracle exactly for an instance tweak and a property tweak, on consistent and concurrent children, sync, async and low-priority, with batch update, callback and dispose), the priming helpers, and all 19 delay hooks firing. It also demonstrated F1 as a side effect. Two facts worth knowing for every later probe: XSFT is the default policy in this build (`optimus.profile.enableXSFT` defaults to true, so a root lookup returns a proxy), and the global caches are null until `NodeCacheConfigs` initialises (`CacheFixtures.init()`).
+
+### Tier 0, fixture-free (W1, W5, W6, W7, W12, W14)
+
+| Probe | Target | Outcome | Observed |
+|-------|--------|---------|----------|
+| W1 | D3 | **demonstrated** at width 2 and 0; not at the default 6 | Mask `2_0_0_80_0_8` decoded at width 2 keeps only the word-0 bit; `fromIndex(136)` folds to `80` and both `subsetOf` and `intersects` against the decoded mask are false. `indexListToMask([200])` folds (`[0,128]`) rather than drops. |
+| W5 | D13, F1 | **demonstrated** | See D13 and F1. |
+| W6 | F7 | **demonstrated** | See F7. |
+| W7 | F2, F3 | **demonstrated**, precondition noted | See F2/F3. |
+| W12 | D14 | **demonstrated** by the identity path | See D14. `Thread.suspend` is unsupported on JDK 21; the cleaner was stopped with the test-only `afterTest()` for the first case, and was left running for the second, which spins regardless. |
+| W14 | cleanup gap | **demonstrated**, new D15 | 21,479 graphs / 108 M instances clean when `Invalid` tracks have only `Invalid` callers; 524 k violations otherwise, minimal counterexample under D15. The redundant-edge id algorithm held in every enumerated case, including stale initial ids and duplicate parallel edges. |
