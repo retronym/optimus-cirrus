@@ -1,0 +1,273 @@
+H4 retention soak (CACHE_CAMPAIGN.md Tier 2 H4). optimus.graph.CacheSoak (probes/cache/src/optimus/graph/CacheSoak.scala), driver probes/cache/run-cache-soak.sh.
+Reuses CacheHunter's spec generator (GSpec/Mat/HRt), the H2 value oracle (H2Child.check, HOracle) and H3's tracker driver, checkpoint, invalidation
+and TTrack-reachability oracles (copied into SoakBInst and adapted for an unbounded run). JDK 21, entity agent + CacheDelayAgent + WorkQueue DelayAgent.
+Logs: scratchpad cache-soak/ (soak-<run>-seg<k>.log per JVM segment, driver-<run>.txt), repro/ for the follow-up runs, attempt1/2 and b-lpon-* for
+the discarded first launches.
+
+================================================================ Commands (all four started 02:21-02:36, 60 min each, run concurrently; host load avg 75-85 on 18 cores from other agents)
+
+  O="-Xmx3g -Doptimus.gthread.ideal=4 -Dprobes.delay.maxNanos=50000"          # production cacheSize (850000) untouched
+  A        SOAK_OPTS="$O"                                                            probes/cache/run-cache-soak.sh a 60 1000
+  B-lpoff  SOAK_TAG=lpoff     SOAK_OPTS="$O -Dhunter.off=lp"                         probes/cache/run-cache-soak.sh b 60 2000
+  B-wm1    SOAK_TAG=lpoff-wm1 SOAK_OPTS="$O -Dhunter.off=lp -Doptimus.tracking.cleanup.ttrackClearedNodeRefWatermark=1"  probes/cache/run-cache-soak.sh b 60 2000
+  B-lpon   SOAK_TAG=lpon      SOAK_OPTS="$O"                                         probes/cache/run-cache-soak.sh b 42 2000   (restarted 02:36 with the starvation probe)
+  follow-ups (5-7 min each): same commands with -Dhunter.soakRoot=N / -Dhunter.soakNoRebase=true / -Dhunter.soakNoDispose=true / -Dhunter.off=lp,when,
+  and the census/scopedTotal instrumentation (now part of every SUMMARY line).
+
+================================================================ Design as run
+
+A: 20 fixed H2 specs (seeds 1000..1019, 12-500 props, 2-18 scenario nodes, ~191 k (key x stack) pairs), scenario trees built ONCE on one uniqueID root
+   per DAG and cycled forever by 4 client threads (random DAG/node/key, 10% under a child cancel scope cancelled after 0-3 ms). Oracle: H2Child.check.
+B: 3 roots (seeds 2000, 2001, 2002: 14, 245, 365 props), each its own spec and tracker plan t0 root / t1 consistent child / t2 concurrent child /
+   t3 consistent child of t2 created by the newChild action and disposed at a checkpoint (p=1/4 once >= 5 phases old), 2 clients per root, driver
+   actions with a fresh RNG seed per phase (add/addAsync/batch/evaluate/async/low-priority/newChild/setPluginTag/cancellable eval). Tags on root 0
+   only (tags everywhere made F8 mask everything). H3 checkpoint after every phase (clients paused, queues idle): value oracle on every recorded
+   node, over/under invalidation against the previous snapshot, TTrack reachability for every valid non-XS node. To stay bounded for an hour the
+   harness rebases every tracker's version history to its last state at each checkpoint, clears Mat's identity memos, removes poisoned-subtree
+   tweaks (recovery; never needed: recovered=0) and reports each STALE_LATENT node once.
+SUMMARY every 300 s, taken quiescent (A: clients paused + scheduler settled; B: all roots parked at a checkpoint barrier): heap after 2x System.gc(),
+   global/siGlobal getSizeIndicative(true), verifyInvariants on both (WARN/ERROR counted by a logback appender; throws caught), approxNumCacheEntries,
+   CacheIDs.global size, per tracker: ttracks roots, TTrack nodes reachable, ptrack edges, TTrackRefs, cleared TTrackRefs, refQ cleared counter;
+   og.worker threads, _onStalledCallbacks, per-tracker workQueue/lowPriorityQueue/inFlightWork (sampled before the barrier), cumulative oracle counters.
+Deviations: (1) B's key set is NOT constant: every update generates fresh tweak values, so new XSFT/XS minimum-scenario entries are legitimate (see
+   finding S2); the only constant-key run is A. (2) B ran with low-priority evaluations off (B-lpoff, B-wm1) because with them on root 2 starves
+   (finding S3) and the JVM died every 1-2 min before the starvation probe was added; B-lpon is the low-priority run. (3) The watermark-1 run ran
+   concurrently instead of after the first hour. (4) Load from other agents throttled throughput; numbers are per-run absolute.
+
+================================================================ Drift tables (one row per 5-minute sample; n=0 is the cold start, the last row is the post-stop sample)
+
+drift table a
+          seg             n         upSec     quiescent        heapMB        global      siGlobal approxEntries      cacheIDs    invWarnTot     invErrTot     ogWorkers       threads     onStalled      findings
+            0             0             0           yes            29           122             0           122           121             0             0             2            11             0             0
+            0             1           304           yes           133        101686           776        102462           121             0             0             3            13             0         10345
+            0             2           603           yes           193        142856           792        143648           121             0             0             3            13             0         27557
+            0             3           907           yes           216        178351           797        179148           121             0             0             3            13             0         59470
+            0             4          1227           yes           251        201439           798        202237           121             0             0             3            13             0        101439
+            0             5          1533           yes           259        217699           798        218497           121             0             0             3            13             0        154841
+            0             6          1838           yes           274        225764           798        226562           121             0             0             3            13             0        210228
+            0             7          2142           yes           275        232072           798        232870           121             0             0             3            13             0        273885
+            0             8          2421           yes           283        236280           798        237078           121             0             0             3            13             0        344702
+            0             9          2713           yes           285        242102           798        242900           121             0             0             3            13             0        589279
+            0            10          3013           yes           291        243910           798        244708           121             0             0             3            13             0        830974
+            0            11          3316           yes           286        244435           798        245233           121             0             0             3            13             0       1110926
+            0            12          3612           yes           286        244678           798        245476           121             0             0             3            13             0       1394710
+            0            13          3625           yes           286        244678           798        245476           121             0             0             3             8             0       1394711
+fit over 13 samples (n>=1, per 5 min), first-half vs second-half slope
+          heapMB slope/5min=       10.13 first-half=       26.80 second-half=        1.43 min=133 max=291 last=286  levels off
+          global slope/5min=     9989.74 first-half=    24800.20 second-half=     2033.82 min=101686 max=244678 last=244678  levels off
+        siGlobal slope/5min=        0.91 first-half=        3.69 second-half=        0.00 min=776 max=798 last=798  levels off
+   approxEntries slope/5min=     9990.65 first-half=    24803.89 second-half=     2033.82 min=102462 max=245476 last=245476  levels off
+        cacheIDs slope/5min=        0.00 first-half=        0.00 second-half=        0.00 min=121 max=121 last=121  flat
+      invWarnTot slope/5min=        0.00 first-half=        0.00 second-half=        0.00 min=0 max=0 last=0  flat
+       invErrTot slope/5min=        0.00 first-half=        0.00 second-half=        0.00 min=0 max=0 last=0  flat
+       ogWorkers slope/5min=        0.00 first-half=        0.00 second-half=        0.00 min=3 max=3 last=3  flat
+         threads slope/5min=       -0.16 first-half=        0.00 second-half=       -0.54 min=8 max=13 last=8  declining
+       onStalled slope/5min=        0.00 first-half=        0.00 second-half=        0.00 min=0 max=0 last=0  flat
+final oracle counters: req=32977005 req.value=27739787 req.isd=5220231 req.cancelScope=3297176 req.cancelled=13847 req.xsBindUnsupported=0 findings=1394711
+final families: CANCEL_LEAK:-=3140,ORACLE:D4=38054,ORACLE:F8=884645,ORACLE:XS=468872
+
+drift table b-lpoff
+          seg             n         upSec     quiescent        heapMB        global      siGlobal approxEntries      cacheIDs    invWarnTot     invErrTot     ogWorkers       threads     onStalled         roots        tracks         edges          refs   clearedRefs      recorded            wq            lp      inFlight maxIdleWaitMs      findings
+            0             0             1           yes            28          1277            21          1298             7             0             0             4            30             0             0          1467          3440          1068             0          1212            21             0            15             2             0
+            0             1           302           yes           170         29980            84         30064             3             0             0             4            39             0             0          4578          7333          2891            72          8226             0             0            15            88          4380
+            0             2           602           yes           304         47200            88         47288             3             0             0             4            39             0             0          4618          7378          2828             7          9147            14             2            15           123         11563
+            0             3           903           yes           397         65630            88         65718             2             0             0             4            39             0             0          4668          6928          2229            64          9371             4             0            10           123         25014
+            0             4          1212           yes           536         82885            89         82974             2             0             0             4            39             0             0          4205          5055          2108            55          9641            16             0             8           144         38297
+            0             5          1518           yes           605         99189            89         99278             2             0             0             4            39             0             0          3425          3886          1868            16          9556            11             2            10           144         51440
+            0             6          1828           yes           736        116668            89        116757             2             0             0             4            39             0             0          3827          5318          2727            25          9581             8             0            18           144         63477
+            0             7          2141           yes           809        133118            89        133207             3             0             0             4            39             0             0          4728          6186          2580            31          9970            12             0            11           144         77276
+            0             8          2424           yes           930        148729            89        148818             2             0             0             4            39             0             0          5240          6822          1841            31          9745             6             0            10           144         97916
+            0             9          2730           yes          1160        188895            89        188984             3             0             0             4            39             0             0          4926          6779          2197            19          9592            10             0            17           144        154554
+            0            10          3045           yes          1431        211580            89        211669             2             0             0             4            39             0             0          5563          6830          2022            87          9746             4             0            11           144        197776
+            0            11          3361           yes          1381        211480            89        211569             4             0             0             4            38             0             0          7378          9915          2001            59          9715            12             0            12           144        241358
+            0            12          3650           yes          1508        212370            89        212459             4             0             0             4            39             0             0          7209          9552          2225           106          9651            10             0            12           285        287970
+            0            13          3690           yes          1405        212455            89        212544             4             0             0             4            36             0             0          2557          2980          2014             0          9672            14             0            24           285        287992
+fit over 13 samples (n>=1, per 5 min), first-half vs second-half slope
+          heapMB slope/5min=      117.34 first-half=      110.63 second-half=      113.04 min=170 max=1508 last=1405  still growing
+          global slope/5min=    17042.08 first-half=    17333.20 second-half=    13852.79 min=29980 max=212455 last=212455  still growing
+        siGlobal slope/5min=        0.21 first-half=        0.83 second-half=        0.00 min=84 max=89 last=89  levels off
+   approxEntries slope/5min=    17042.29 first-half=    17334.03 second-half=    13852.79 min=30064 max=212544 last=212544  still growing
+        cacheIDs slope/5min=        0.12 first-half=       -0.23 second-half=        0.29 min=2 max=4 last=4  still growing
+      invWarnTot slope/5min=        0.00 first-half=        0.00 second-half=        0.00 min=0 max=0 last=0  flat
+       invErrTot slope/5min=        0.00 first-half=        0.00 second-half=        0.00 min=0 max=0 last=0  flat
+       ogWorkers slope/5min=        0.00 first-half=        0.00 second-half=        0.00 min=4 max=4 last=4  flat
+         threads slope/5min=       -0.12 first-half=        0.00 second-half=       -0.36 min=36 max=39 last=36  levels off
+       onStalled slope/5min=        0.00 first-half=        0.00 second-half=        0.00 min=0 max=0 last=0  flat
+           roots slope/5min=        0.00 first-half=        0.00 second-half=        0.00 min=0 max=0 last=0  flat
+          tracks slope/5min=      110.76 first-half=     -222.77 second-half=       -4.39 min=2557 max=7378 last=2557  levels off
+           edges slope/5min=       51.18 first-half=     -640.69 second-half=      -36.50 min=2980 max=9915 last=2980  levels off
+            refs slope/5min=      -53.16 first-half=     -109.17 second-half=      -40.21 min=1841 max=2891 last=2014  declining
+     clearedRefs slope/5min=        0.83 first-half=       -6.20 second-half=        3.46 min=0 max=106 last=0  still growing
+        recorded slope/5min=       72.10 first-half=      236.34 second-half=      -34.25 min=8226 max=9970 last=9672  levels off
+              wq slope/5min=        0.31 first-half=        1.23 second-half=        0.57 min=0 max=16 last=14  still growing
+              lp slope/5min=       -0.08 first-half=        0.00 second-half=        0.00 min=0 max=2 last=0  levels off
+        inFlight slope/5min=        0.34 first-half=       -0.06 second-half=        1.36 min=8 max=24 last=24  still growing
+   maxIdleWaitMs slope/5min=       11.41 first-half=       10.40 second-half=       25.18 min=88 max=285 last=285  still growing
+final oracle counters: phases=118391 checkpoints=118394 eval.checked=2122445 eval.value=1895054 eval.ambiguous=3 eval.skippedPoisoned=0 eval.skippedRebased=0 chk.valid=26222964 chk.validOk=25942646 inv.expected=1503695 inv.over=0 inv.under=259664 inv.untouchedValid=24029347 ttrack.nodesChecked=22354172 ttrack.edgesChecked=30465211 recovered=0 trk.late=8085 trk.lateDisposed=8082 findings=287992
+final families: ORACLE:UNEXPLAINED=13,ORACLE:XS=7661,STALE_LATENT:LATENT=5,STALE_SERVED:UNEXPLAINED=350,STALE_SERVED:XS=279963
+
+drift table b-lpoff-wm1
+          seg             n         upSec     quiescent        heapMB        global      siGlobal approxEntries      cacheIDs    invWarnTot     invErrTot     ogWorkers       threads     onStalled         roots        tracks         edges          refs   clearedRefs      recorded            wq            lp      inFlight maxIdleWaitMs      findings
+            0             0             2           yes            29          1170            34          1204             7             0             0             4            30             0             0          1290          3609          1000             0          1123            10             0            23             9             0
+            0             1           302           yes           170         29598            84         29682             3             0             0             4            39             0             0          2925          4815          2528             0          8219             0             0             8           395             4
+            0             2           603           yes           305         46401            87         46488             3             0             0             4            39             0             0          3147          3612          2037             0          9327             2             0            14           395          1982
+            0             3           903           yes           400         66008            88         66096             3             0             0             4            39             0             0          3725          5414          2245            31          9396            15             0             8           395         10128
+            0             4          1212           yes           540         83719            88         83807             3             0             0             4            39             0             0          3341          4429          2850             0          9634             4             0             9           395         18074
+            0             5          1520           yes           609        100000            88        100088             2             0             0             4            39             0             0          3319          4065          2500            32          9676            22             0            14           395         29461
+            0             6          1830           yes           739        116638            88        116726             3             0             0             4            39             0             0          2980          3605          2291             0          9550             9             0            13           395         42041
+            0             7          2143           yes           810        132084            88        132172             4             0             0             4            39             0             0          3723          4835          2052            26          9655             8             0             5           395         53801
+            0             8          2425           yes           934        148012            88        148100             2             0             0             4            39             0             0          4332          5050          1758            13          9563            12             0            11           395         69117
+            0             9          2731           yes          1159        187746            88        187834             2             0             0             4            39             0             0          8277         11445          2684            96          9698            16             0            11           395        114045
+            0            10          3048           yes          1430        212431            88        212519             3             0             0             4            39             0             0          7727         10407          3139            66          9838             6             0            12           395        157025
+            0            11          3366           yes          1395        211618            88        211706             2             0             0             4            36             0             0          5938          7840          2266           178          9588            13             0            15           395        192374
+            0            12          3652           yes          1519        212224            88        212312             2             0             0             4            39             0             0          5745          7471          2413            70          9584             2             0            16           395        230754
+            0            13          3691           yes          1416        212323            88        212411             2             0             0             4            36             0             0          2685          3365          2370             0          9584             9             0            23           395        230775
+fit over 13 samples (n>=1, per 5 min), first-half vs second-half slope
+          heapMB slope/5min=      118.08 first-half=      111.34 second-half=      115.14 min=170 max=1519 last=1416  still growing
+          global slope/5min=    17037.95 first-half=    17534.51 second-half=    14036.18 min=29598 max=212431 last=212323  still growing
+        siGlobal slope/5min=        0.16 first-half=        0.66 second-half=        0.00 min=84 max=88 last=88  levels off
+   approxEntries slope/5min=    17038.11 first-half=    17535.17 second-half=    14036.18 min=29682 max=212519 last=212411  still growing
+        cacheIDs slope/5min=       -0.09 first-half=       -0.09 second-half=       -0.21 min=2 max=4 last=2  declining
+      invWarnTot slope/5min=        0.00 first-half=        0.00 second-half=        0.00 min=0 max=0 last=0  flat
+       invErrTot slope/5min=        0.00 first-half=        0.00 second-half=        0.00 min=0 max=0 last=0  flat
+       ogWorkers slope/5min=        0.00 first-half=        0.00 second-half=        0.00 min=4 max=4 last=4  flat
+         threads slope/5min=       -0.16 first-half=        0.00 second-half=       -0.43 min=36 max=39 last=36  declining
+       onStalled slope/5min=        0.00 first-half=        0.00 second-half=        0.00 min=0 max=0 last=0  flat
+           roots slope/5min=        0.00 first-half=        0.00 second-half=        0.00 min=0 max=0 last=0  flat
+          tracks slope/5min=      246.31 first-half=       11.63 second-half=      -93.82 min=2685 max=8277 last=2685  declining
+           edges slope/5min=      299.11 first-half=     -162.17 second-half=     -113.32 min=3365 max=11445 last=3365  levels off
+            refs slope/5min=        9.44 first-half=       23.11 second-half=       65.93 min=1758 max=3139 last=2370  still growing
+     clearedRefs slope/5min=        7.02 first-half=        1.86 second-half=        4.21 min=0 max=178 last=0  still growing
+        recorded slope/5min=       59.96 first-half=      226.86 second-half=      -10.04 min=8219 max=9838 last=9584  levels off
+              wq slope/5min=        0.24 first-half=        2.69 second-half=       -0.71 min=0 max=22 last=9  declining
+              lp slope/5min=        0.00 first-half=        0.00 second-half=        0.00 min=0 max=0 last=0  flat
+        inFlight slope/5min=        0.71 first-half=        0.74 second-half=        2.43 min=5 max=23 last=23  still growing
+   maxIdleWaitMs slope/5min=        0.00 first-half=        0.00 second-half=        0.00 min=395 max=395 last=395  flat
+final oracle counters: phases=117745 checkpoints=117747 eval.checked=2111296 eval.value=1883319 eval.ambiguous=0 eval.skippedPoisoned=0 eval.skippedRebased=0 chk.valid=25972816 chk.validOk=25747910 inv.expected=1498644 inv.over=0 inv.under=262025 inv.untouchedValid=23836216 ttrack.nodesChecked=22170921 ttrack.edgesChecked=30175831 recovered=0 trk.late=8035 trk.lateDisposed=8035 findings=230775
+final families: ORACLE:UNEXPLAINED=16,ORACLE:XS=5853,STALE_LATENT:LATENT=4,STALE_SERVED:UNEXPLAINED=326,STALE_SERVED:XS=224576
+
+drift table b-lpon
+          seg             n         upSec     quiescent        heapMB        global      siGlobal approxEntries      cacheIDs    invWarnTot     invErrTot     ogWorkers       threads     onStalled         roots        tracks         edges          refs   clearedRefs      recorded            wq            lp      inFlight maxIdleWaitMs      findings
+            0             0             4           yes            30          2344            47          2391             7             0             0             4            30             0             0          2512          7709          2008             0          2281            27             2             7            16             0
+            0             1           305           yes           141         27045            83         27128             3             0             0             4            39             0             0          3778          7278          2248            89          8032             8             4             9          3119           797
+            0             2           619           yes           316         60324            85         60409             2             0             0             4            39             0             0          8050         15198          8770             0          9558             0             4            14          3119          5832
+            0             3           917           yes           417         79894            88         79982             2             0             0             4            39             0             0          6914         11056          5935           337          9668            11             4             9          3119          7487
+            0             4          1222           yes           619        106562            88        106650             2             0             0             4            39             0             0          7837         15011          6487             0         10605             7             4            19          3119         12115
+            0             5          1517           yes           736        132073            88        132161             3             0             0             4            39             0             0          6607         11829          5959             0         10563             4             4            12          3119         18138
+            0             6          1829           yes          1140        192575            88        192663             2             0             0             4            39             0             0          8442         17126          9663             0         10060             4            10            15          3119         30678
+            0             7          2135           yes          1273        211003            88        211091             4             0             0             4            39             0             0          5384          7041          3243             7         10456             8            14            18          3119         40742
+            1             0             0           yes            29          2038            38          2076             7             0             0             4            30             0             0          2277          5902          1631             0          1990             0             0             0             0             0
+            1             1           177           yes           323         67873            87         67960             2             0             0             4            39             0             0          8324         25830          4235            13          9322            10             4             9           357          2431
+fit over 8 samples (n>=1, per 5 min), first-half vs second-half slope
+          heapMB slope/5min=       99.35 first-half=      153.50 second-half=     -110.60 min=141 max=1273 last=323  declining
+          global slope/5min=    16699.35 first-half=    25812.10 second-half=   -17417.20 min=27045 max=211003 last=67873  declining
+        siGlobal slope/5min=        0.51 first-half=        1.80 second-half=       -0.30 min=83 max=88 last=87  levels off
+   approxEntries slope/5min=    16699.86 first-half=    25813.90 second-half=   -17417.50 min=27128 max=211091 last=67960  declining
+        cacheIDs slope/5min=        0.05 first-half=       -0.30 second-half=       -0.10 min=2 max=4 last=2  declining
+      invWarnTot slope/5min=        0.00 first-half=        0.00 second-half=        0.00 min=0 max=0 last=0  flat
+       invErrTot slope/5min=        0.00 first-half=        0.00 second-half=        0.00 min=0 max=0 last=0  flat
+       ogWorkers slope/5min=        0.00 first-half=        0.00 second-half=        0.00 min=4 max=4 last=4  flat
+         threads slope/5min=        0.00 first-half=        0.00 second-half=        0.00 min=39 max=39 last=39  flat
+       onStalled slope/5min=        0.00 first-half=        0.00 second-half=        0.00 min=0 max=0 last=0  flat
+           roots slope/5min=        0.00 first-half=        0.00 second-half=        0.00 min=0 max=0 last=0  flat
+          tracks slope/5min=      260.07 first-half=     1104.10 second-half=      209.30 min=3778 max=8442 last=8324  levels off
+           edges slope/5min=     1239.37 first-half=     1905.70 second-half=     3191.80 min=7041 max=25830 last=25830  still growing
+            refs slope/5min=      -36.55 first-half=      988.20 second-half=    -1159.20 min=2248 max=9663 last=4235  declining
+     clearedRefs slope/5min=      -17.95 first-half=        7.00 second-half=        4.60 min=0 max=337 last=13  still growing
+        recorded slope/5min=      174.45 first-half=      782.90 second-half=     -332.70 min=8032 max=10605 last=9322  declining
+              wq slope/5min=        0.36 first-half=        0.80 second-half=        2.20 min=0 max=11 last=10  still growing
+              lp slope/5min=        0.81 first-half=        0.00 second-half=        0.40 min=4 max=14 last=4  still growing
+        inFlight slope/5min=        0.37 first-half=        2.50 second-half=       -0.60 min=9 max=19 last=9  levels off
+   maxIdleWaitMs slope/5min=     -230.17 first-half=        0.00 second-half=     -828.60 min=357 max=3119 last=357  declining
+final oracle counters: phases=8601 checkpoints=8604 eval.checked=225106 eval.value=194254 eval.ambiguous=0 eval.skippedPoisoned=0 eval.skippedRebased=0 chk.valid=1324791 chk.validOk=1322488 inv.expected=124502 inv.over=0 inv.under=13634 inv.untouchedValid=1169982 ttrack.nodesChecked=1191531 ttrack.edgesChecked=2386719 recovered=0 trk.late=576 trk.lateDisposed=575 findings=2431
+final families: ORACLE:UNEXPLAINED=1,ORACLE:XS=119,STALE_LATENT:LATENT=2,STALE_SERVED:XS=2301,STARVED:-=4,STARVED_PROBE:-=4
+
+================================================================ Retention verdicts (fit over the 12 five-minute samples)
+
+Flat for the whole hour in every JVM: CacheIDs.global (A 121, B 2-4), og.worker threads (A 3, B 4), live threads, _onStalledCallbacks (0),
+   siGlobal (A 798, B 88-89), verifyInvariants (0 WARN, 0 ERROR on global and siGlobal at all 52 quiescent samples), TTrack graphs per root
+   (B: roots/tracks/edges/refs oscillate 2-10 k with no trend; cleared TTrackRefs 0-337, collected by cleanup at both watermarks), recorded-node
+   map (~9.6 k), tracker queues drain at every checkpoint (wq/lp/inFlight at the sample are in-flight work of running clients, max 24).
+A global: 101 k -> 244.7 k, slope 24.8 k/5 min in the first half, 2.0 k in the second, last three samples 243.9/244.4/244.7 k: LEVELS OFF.
+   Heap after GC 133 -> 286 MB, levels off (second-half slope 1.4 MB/5 min). Caveat: the plateau is near both the fixed key set (191 k key x stack
+   pairs plus XS/XSFT proxies, 35% of entries at 5 min) and the S1 floor (212,500); scopedTotal was added after the hour-long A run, and a 5-min A
+   rerun had already cut the effective cap to 556 k, so whether A saturated its key set or hit the shrinking cap is not separated.
+B global: +17.0 k/5 min, linear, until it hits 212,500 (= 850,000 >> 2) at ~50 min in B-lpoff and B-wm1, then flat (B-lpon reached 211 k at 36 min, then its R6 hang). Heap +117 MB/5 min,
+   1.4-1.5 GB at the cap, flat afterwards. Not a leak of entries (census: invalid entries 0-180 at any time; entries carry ~50 k distinct SSCacheIDs
+   per 60 k entries: fresh XSFT minimum scenarios for fresh tweak values, unreachable after the next update and held only until LRU eviction),
+   but the 212,500 cap is not the configured 850,000: see S1.
+
+================================================================ Findings
+
+S1 (NEW, M) NodeScopedCache size accounting leaks, so the global cache's effective capacity collapses to its 25% floor.
+   NodeScopedCache.newEntryAdded increments the static LongAdder totalSize; the only decrement is resetSizeReporting(), called only from
+   CacheSelector.Scoped.onOwnerReset() <- ScenarioStack.withRecorded (XS owner completion). UNodeCache.adjustedMaxSize returns
+   max(maxSize/4, maxSize - totalSize) when scopedCachesReducesGlobalSize (default = scopeXSCache = true). Any scoped cache dropped without
+   onOwnerReset keeps its count forever. Which drop path leaks was not pinned down; candidates are XS owners whose recording stack is abandoned
+   without withRecorded (completion by exception or cancellation, or a proxy that re-runs the owner) and Scoped.newScoped(), which builds a new
+   scoped cache next to the current one. Measured with scopedTotal in SUMMARY, all
+   samples quiescent (no evaluation in flight, so no live scoped cache should be counted):
+       B (3 roots, lpoff)  t=60 s 184 k, 121 s 465 k, 181 s 698 k, 242 s 925 k, 302 s 1,224 k;  globalMaxAdjusted 665 k -> 385 k -> 212,500 from t=181 s
+       A (H2 fixed DAGs)   t=61 s  75 k, 122 s 143 k, 182 s 207 k, 244 s 254 k, 305 s   294 k;  globalMaxAdjusted 775 k -> 556 k, still falling
+   Monotone, never decreases, exceeds every plausible live scoped-cache population by orders of magnitude. Effect: after minutes of XS traffic the
+   global cache evicts at 212,500 instead of 850,000 for the life of the process (hit rate, not memory). Not D1-D18, F18, R6 or R14. Fix direction:
+   reset (or decrement on drop) every scoped cache that leaves a selector chain, e.g. in Scoped.newScoped and on owner completion by exception or
+   cancellation; or account live size via a cleaner. (repro/scoped-b.log, repro/scoped-a.log; cmd in repro/cmd-scoped-*.txt)
+S2 (observation, L) B's linear growth before the cap is XSFT/XS entries for fresh tweak values (census: proxies 1-2%, TweakNodes 3%, the rest plain
+   nodes under ~one SSCacheID each). Retained heap per cached entry is ~6.6 KB in B against ~1.2 KB in A; at the nominal 850 k cap that would be
+   ~5.6 GB (B would OOM a 3 GB heap before the LRU caps it if S1 were fixed). Not a leak; a sizing note for tracker-heavy processes.
+S3 (observation, design) Low-priority starvation. With low-priority evaluations on, root 2 (seed 2002, 365 props) never completes a driver's
+   low-priority evaluation while its two clients keep issuing foreground evaluations: lowPriorityQueue holds 5-19 actions, the concurrent child's
+   in-flight work keeps the parent queue busy. The soak first classified it QUEUE_STALL (7 JVM deaths in 7 segments of 1-2 min). Probe: after 20 s
+   pause the clients; in all 36 occurrences (STARVED/STARVED_PROBE 32+4) the futures then completed within ~0.5 s. Starvation by foreground load,
+   not a wedge. Matches the queue's documented semantics (low-priority only when the queue is otherwise idle); worth a note because nothing bounds it.
+
+Hangs / JVM deaths (all runs, including discarded launches):
+   R6        2  HANG-CLASS R6(lowPriCancel waits under queueLock; cancelled node's thread blocked in afterActionCompleted). attempt1 (5.5 min) and
+                B-lpon seg0 at 38 min (og.worker blocked in afterActionCompleted:292, clients BLOCKED in registerOrEnqueueAction). Known R6, organic.
+   S3        7  QUEUE_STALL root 2 phase 8/9/11 (before the starvation probe); reclassified as starvation by the probe.
+   harness   1  attempt1 A: H2Child.leakDiag resolves keys through the single H2Child.curSys, which is wrong with 20 ProbeSystems in one JVM
+                (ArrayIndexOutOfBounds, client threads died, watchdog). Fixed by disabling leakDiag in the soak.
+   none in A (60 min), B-lpoff (60 min), B-wm1 (60 min).
+
+================================================================ Pass/fail totals (final cumulative counters)
+
+A (60 min, 1 segment): value oracle 32,977,005 requests: 27,739,787 values, 5,220,231 ISD, 3,297,176 under a cancel scope (13,847 cancelled).
+   Failures (FINDING counts per request): ORACLE F8 884,645; ORACLE XS 468,872 (D1 family); ORACLE D4 38,054; CANCEL_LEAK 3,140 (D17);
+   UNEXPLAINED 0; HARNESS 0; H5 not run. Counts are per request and repeat: the same stale/poisoned cache entries are hit again and again over an hour.
+B-lpoff (60 min): value oracle 2,122,445 checked evaluations (1,895,054 values), checkpoint stale check 26,222,964 valid nodes (25,942,646 ok),
+   invalidation oracle 1,503,695 expected, 0 over, 259,664 under-but-touched (not failures, H3 semantics), 24,029,347 untouched-valid,
+   reachability 22,354,172 nodes / 30,465,211 TTrack edges with 0 TTRACK failures. 118,391 phases, 8,082 late-child dispose/recreate cycles.
+   Failures: STALE_SERVED XS 279,963 + ORACLE XS 7,661 (D1 family); STALE_SERVED UNEXPLAINED 350; ORACLE UNEXPLAINED 13; STALE_LATENT 5.
+B-wm1 (60 min): 2,111,296 checked evaluations; 25,972,816 valid nodes (25,747,910 ok); invalidation 1,498,644 / 0 over / 262,025 under-touched;
+   reachability 22,170,921 nodes / 30,175,831 edges, 0 TTRACK failures. Failures: STALE_SERVED XS 224,576, ORACLE XS 5,853, STALE_SERVED
+   UNEXPLAINED 326, ORACLE UNEXPLAINED 16, STALE_LATENT 4.
+B-lpon (42 min, 2 segments): 1,449,690 checked evaluations; 10,449,389 valid nodes (10,408,475 ok); invalidation 809,659 / 0 over / 120,906;
+   reachability 9,001,682 nodes / 15,317,467 edges, 0 TTRACK failures. Failures: STALE_SERVED XS 40,539, ORACLE XS 2,169, STALE_SERVED
+   UNEXPLAINED 368, ORACLE UNEXPLAINED 18, STALE_LATENT 7; STARVED 36 (S3); 1 R6 hang.
+Over-invalidation: 0 in all four hour-long runs; 1 in a 4-min single-root follow-up without rebase (repro/r2-norebase-nodispose.log, root 2 t1,
+   phase 123), not reproduced.
+
+================================================================ UNEXPLAINED classification (B)
+
+ORACLE UNEXPLAINED (13/16/18 per run): wrong values almost only on the concurrent child t2 and on t3 (consistent child created by newChildScenario
+   under t2), suspects RACING_UPDATE/CONC_CHILD/LATE_CHILD, roots 0 and 2. Same shape as the fuzzer's D18 report (concurrent child + late child +
+   by-name/when tweaks; the specs carry many when(bit(pX)) predicates whose read keys the drivers retweak). Classified D18-family, not minimised.
+STALE_SERVED UNEXPLAINED (350/326/368): counts repeat per checkpoint until the stale node is replaced; distinct events are few:
+   root 2 t1 (consistent child of the root, sibling of the concurrent child) at phase 454-455, in 4 of 5 default-configuration JVMs (B-lpoff,
+   B-wm1, attempt2 lpoff and attempt2 wm1; not in repro/3root-default-2), never in 3 runs without rebase or without dispose; driver actions are
+   deterministic per (seed, phase), the values identical across JVMs (cached 729863718228367142 vs oracle 729864047007117110 for p127[e1,1]).
+   Only t2 was updated in phase 454. Inconclusive between a concurrent-sibling effect and a harness/model artefact of the rebase; NOT claimed.
+   root 1 t1 phase 203-204 (B-lpoff) and root 1 t2 phases 163-167 / 286-288 (B-lpon, repro nodispose): stale in the concurrent child or its
+   sibling after when-predicate reads were retweaked in the parent (phase log: t0 add p49:=BYNAME, p71 has when(bit0(p49))): D18 mechanism
+   (when-predicated by-name TweakNode keeps matching the untweaked key), classified D18. A 7-min root-1-only repro with off=when showed no
+   UNEXPLAINED, but neither did the same run with when on, so the toggle is not evidence either way.
+Known families seen, by name: D1 (XS), D4, D17 (CANCEL_LEAK), D18, F8, R6. Not seen in the hour: F18 TAG_DOUBLE_WRAP (tags only on the 14-prop root),
+   R14 (no UPDATE_FAILED), F19.
+
+================================================================ Other observations
+
+verifyInvariants is only meaningful quiescent: called under traffic in the smoke runs it threw GraphInInvalidState "entry ... exists in LRU and in
+   a ledger" at every sample (ledgers fill while it walks; it does not lock them despite the comment). All quiescent calls passed.
+Census of the global table at 5 min: A 164 k entries, 0 invalid, 36 k done-with-exception, 57 k proxies, 81 k distinct SSCacheIDs; B 60 k entries,
+   25-180 invalid, 8 k exception, 2 k TweakNodes, 1 k proxies, 50 k distinct SSCacheIDs.
