@@ -62,11 +62,11 @@ stateDiagram-v2
     si: SI stack<br/>copy of root, cacheID #1
     trk: tracking scenario<br/>MutableSSCacheID, mutated in place
     [*] --> root
-    root --> a1: createChild(S) interns SSCacheKey(1, S)
-    root --> a2: createChild(S) again, hit in CacheIDs.global
-    root --> b: createChild(S'), new key
-    root --> si: ssShared.siStack (see D4)
-    root --> trk: DependencyTracker (§6)
+    root --> a1: createChildS interns SSCacheKey1, S
+    root --> a2: createChildS again, hit in CacheIDs.global
+    root --> b: createChildS', new key
+    root --> si: ssShared.siStack see D4
+    root --> trk: DependencyTracker §6
 ```
 
 Tweak resolution for a tweakable property walks the stack from the top: at each level `cacheID.mayContainTweak(info)` (mask test, false positives only) then `cacheID.get(key)` / `get(info)`; `when`-predicated tweaks evaluate their predicate as a node, so resolution itself is asynchronous (`TwkResolver` is a `PropertyNode` that suspends). By-name tweaks produce a `TweakNode` evaluated in the stack where the tweak was found (or where `bind`/`bindOnce` say).
@@ -167,14 +167,14 @@ return true;                                                           // NB: al
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Fresh: created by putIfAbsent (alwaysNeedsProxy)
-    Fresh --> Resolving: run(): find/insert up-proxy at minimumScenario(mask)
-    Resolving --> SelfEval: minSS is my own scenario, or up-proxy said EVALUATE<br/>enqueue my source, continueWith
-    Resolving --> WaitUp: up-proxy said WAIT (it already has a promiser)
+    [*] --> Fresh: created by putIfAbsent alwaysNeedsProxy
+    Fresh --> Resolving: run - find/insert up-proxy at minimumScenariomask
+    Resolving --> SelfEval: minSS is my own scenario, or up-proxy said EVALUATE enqueue my source, continueWith
+    Resolving --> WaitUp: up-proxy said WAIT it already has a promiser
     Resolving --> Completed: up-proxy said TAKE_VALUE and canUseValue
-    SelfEval --> Completed: source done → offerValue(valueOwner), notify promisedToUp/Down
+    SelfEval --> Completed: source done → offerValuevalueOwner, notify promisedToUp/Down
     WaitUp --> Completed: up-proxy offers down, canUseValue
-    WaitUp --> Resolving: offerValue(null) from tryToRecoverFromCycle / breakProxyChains → ips = null, rerun (see D7)
+    WaitUp --> Resolving: offerValuenull from tryToRecoverFromCycle / breakProxyChains → ips = null, rerun see D7
     Completed --> [*]
 ```
 
