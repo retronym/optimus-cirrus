@@ -215,9 +215,33 @@ End-to-end runs of the real scheduler in child JVMs, `probes/run-tier1.sh` (abou
 
 One more observation from T1 worth its own line: with `limitThreads` (the default), a thread moving to `_waiters` does not wake an idle worker (`nextStepForWorkingThread` only does `drainTo` + `addWorkerIfNeeded` under `!limitThreads`), and `addWorkerIfNeeded` counts waiters against the ideal. The design relies on waiting threads finding global work themselves via `canTake`; anything that makes `canTake` lie (R1) therefore leaves runnable work on the global queue with parked idle threads next to it. A periodic "runnable work on the global queue and no worker" check in `fullWait`'s timer branch would turn this class of deadlock into a stall.
 
+## Model checking results (H1, H2)
+
+jcstress and Lincheck under `probes/modelcheck/` (`./fetch.sh && ./build.sh`, then `./run.sh jcstress quick|default`, `./run.sh lincheck`, `./run.sh h2e`). The forked jcstress VMs carry the entity agent, so the tests run against the agent-rewritten `NodeTask`. Full outcome tables in `probes/modelcheck/RESULTS-modelcheck.txt`.
+
+| Test | Outcomes observed | Verdict |
+|------|-------------------|---------|
+| H1 pop vs steal | owner only 84%, thief only 16%, both 0.26% with `top == base` after | no loss |
+| H1 grow vs steal | clean 99.8%; stolen T0 resurrected in the new array 0.19% | no loss |
+| H1 scan vs steal (match at base) | thief got M 28%, scan got M and thief another 70%, M handed out twice 2.1% | no hole, no loss |
+| H1 scan vs steal (match mid) | one outcome | clean |
+| H1 push/pop vs two thieves across `MAX_VALUE` (tight variant) | handed out twice across `resetBounds` 0.02%; never lost, `size()` never negative, `isEmpty()` never lies | reset is sound |
+| H2a `tryAddToWaiterList` vs `complete` | (true, notified once) 50%, (false, caller notifies) 50% | contract holds |
+| H2b two `continueWith` vs `complete` | every waiter called once in 3.9 G samples | holds |
+| H2c `continueWithLast` ordering | 13 orders seen, the Last waiter always after every earlier non-Last waiter | holds |
+| H2d `tryRun` vs `tryRun` | exactly one winner | holds |
+| **H2e `markAsRunnable` vs `complete`** | **forbidden outcome in 2.0–2.4% of samples: `DONE_FLAG` set and `NOT_RUNNABLE` clear** | **fails, new R8** |
+| H2e' `tryMarkAsRunnable` vs `complete` (control) | done and not runnable, 100% | holds |
+
+Lincheck model checking of `WorkQueue` (owner push/pop/scan on one thread, thieves on others; array of 4, of 64, and a wrap variant starting at `MAX_VALUE - 5`; 1.5 M executions per config) passed against an at-least-once deque spec; 2.6–2.9% of executions only linearise if a task was handed out twice. A strict exactly-once spec fails at once with the R7 traces, which confirms the checker sees the real behaviour. Lincheck cannot instrument `NodeTask` (the entity agent adds fields to `TPDMask` at load time that Lincheck's class reader does not see), so H2 is jcstress only. Two deviations from the plan: the wrap test keeps push and pop on one actor because `_top` is owner-only by contract; H2c reaches the private `tryAddToWaiterListLast` through a method handle.
+
+### R8 (M) `markAsRunnable` racing `complete` leaves a completed node runnable
+
+Found by H2e. `markAsRunnable` (NodeTask.java:762) is check-then-act: `if (!isDoneOrRunnable()) updateState(0, STATE_NOT_RUNNABLE)`, and `updateState` is an unconditional CAS loop. If `complete()` lands between the check and the CAS, the node ends in state `STARTED | DONE_FLAG` with `NOT_RUNNABLE` clear: `isDone()` is false, `isDoneEx()` is true, `isRunnable()` is true. The default `onChildCompleted` then enqueues it, `tryRun` wins, and `run()` executes a second time on a node that already has a result; its second completion goes to `logAndDie` (exit 121 in production, the F1b swallow here). Replayed deterministically by `./run.sh h2e`. `tryMarkAsRunnable` already does this right by re-checking `DONE` inside the CAS loop (`tryUpdateState`); `markAsRunnable` should use the same. Reachability needs a node that is waiting on a child to be completed by a third party while the child completes: cycle recovery (`detectCyclesAndRecover` completes a node mid-chain and its comment acknowledges the child's later completion re-enqueues it), cancellation, `tryCompleteWithException` from a non-graph thread, or `markAsRunnableAndEnqueue` racing a completion. Not yet reproduced end to end.
+
 ### R7 (L) Three paths return a task after the write that should have confirmed it was taken fails
 
-`localPop` (OGSchedulerContext.java:410–421) returns `r` even when its CAS failed; `scanToFindWork` (line 566 onward) returns `t` even when `removeAt` found `_base` already past it; `growArray` (line 466 onward) copies slots a thief is concurrently emptying and then resets `_base` below the thief's bump. All three are known to the authors ("tasks can be on more than one queue at a time") and are safe only because `OGSchedulerContext.run` CASes `STATE_NOT_RUNNABLE` before running. Worth stating that invariant as a comment on each site and asserting it under `schedulerAsserts` (a task returned twice must fail the second `tryRun`); and `size()` should not be used as a pending-work count anywhere that matters.
+`localPop` (OGSchedulerContext.java:410–421) returns `r` even when its CAS failed; `scanToFindWork` (line 566 onward) returns `t` even when `removeAt` found `_base` already past it; `growArray` (line 466 onward) copies slots a thief is concurrently emptying and then resets `_base` below the thief's bump; Lincheck found the multi-step form, three steals overlapping one copy and the swap writing `_base = 1`, so two tasks come back and `size()` overstates pending work by the number of steals that overlapped the copy. All three are known to the authors ("tasks can be on more than one queue at a time") and are safe only because `OGSchedulerContext.run` CASes `STATE_NOT_RUNNABLE` before running. Worth stating that invariant as a comment on each site and asserting it under `schedulerAsserts` (a task returned twice must fail the second `tryRun`); and `size()` should not be used as a pending-work count anywhere that matters.
 
 ### F1b (M) A failed kill is swallowed, and the guard then disables every later kill
 

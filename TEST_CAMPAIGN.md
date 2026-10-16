@@ -155,6 +155,7 @@ A 24 h run of H3 scenarios in a loop on a 4-core box with `threadCounter` and `_
 - Tier 0: every probe that needs no delay injection has run (`probes/RESULTS.txt`). Results and amendments in SCHEDULER_REVIEW.md "Tier 0 probe results". Demonstrated: W1b, W1f, W2a, W2b, W3c (as new F1b), W3d, W3e, W3f, W4a, W5a, W5d, W6c. Not reproduced or quantified: the rest. Withdrawn/downgraded: R2 base-overrun case, F4, I1, I3.
 - P3 delay injection: done (ASM agent, `probes/src/probes/DelayAgent.java`, armed per thread via `Delay.arm(ctl, ids...)`, or random parks via `-Dprobes.delay.maxNanos=N` for hunter runs). W1c–e run: W1c and W1e demonstrated (stale returns), W1d not reproduced (resurrection noted). Tier 0 complete.
 - Tier 1 T1, T2, T7, T8: done (`probes/run-tier1.sh`, `probes/RESULTS-tier1.txt`). All four demonstrated; T1 is a permanent hang, T7 and T8 end in a surviving JVM or a hang instead of the predicted exit because `InfoDumper` cannot initialise here (F1b, F2b). Next: H1/H2 (jcstress/Lincheck on WorkQueue and the waiter list), then H3 with `-Dprobes.delay.maxNanos`, then T3–T6, T9–T12.
+- H1/H2 model checking: done (`probes/modelcheck/`). WorkQueue: no loss anywhere, R7 double hand-outs quantified. Waiters: protocol holds. New R8 from H2e: `markAsRunnable` vs `complete` leaves a done node runnable (forbidden 2% of samples). Lincheck cannot instrument the agent-rewritten `NodeTask`.
 
 ## Open questions
 

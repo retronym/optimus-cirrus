@@ -1,0 +1,362 @@
+H1/H2 model checking: WorkQueue (jcstress + Lincheck) and NodeTask _waiters/_state (jcstress)
+==============================================================================================
+
+Commands (from probes/modelcheck):
+  ./fetch.sh                      # jcstress-core 0.16, lincheck-jvm 2.39 via coursier -> jcstress.cp, lincheck.cp
+  ./build.sh                      # javac (jcstress annotation processor) -> classes/{jcstress,lincheck,plain}
+  ./run.sh jcstress quick         # all H1/H2 jcstress tests; results/jcstress-quick-*/summary.txt
+  ./run.sh jcstress default '<regexp>' -v
+  ./run.sh lincheck -Dmc.iterations=150 -Dmc.invocations=10000      # configs grow=4:0 plain=64:0 wrap=4:MAX-5
+  ./run.sh lincheck -Dmc.strict=true -Dmc.iterations=20 grow=4:0    # exactly-once spec: shows the known R7 traces
+  ./run.sh h2e                    # deterministic follow-up to H2 (e)
+
+Every forked VM runs with -javaagent:entityagent.jar (via -jvmArgsPrepend, so jcstress still varies JIT/GC
+flags on top); MC.<clinit> refuses to run if the agent's premain did not run, so all results are against the
+agent-rewritten NodeTask.
+
+Verdict summary
+---------------
+H1 (a) PopVsSteal            OK. Double hand-out (R7) 0.26-0.29%; never lost; final state always top==base.
+H1 (b) GrowVsSteal           OK. Resurrection of the stolen T0 in the new array (W1d) 0.09-0.19%; never lost.
+H1 (c) ScanVsStealBase       OK. M handed out twice (W1e) 1.4-2.1%; no loss, no null hole.
+H1 (c) ScanVsStealMid        OK. Single outcome (scan M, thief T0).
+H1 (d) WrapPushPopVsTwoThieves  OK. Only the exactly-once outcome in 1.6e9 samples (the pop never meets a thief).
+H1 (d') WrapTight...         OK. Double hand-out across resetBounds 0.02%; no loss, no isEmpty() lie, no negative size.
+H1 Lincheck (at-least-once)  PASSED in all 3 configs (4.56M executions); 2.6-2.9% of executions only linearize
+                             with a duplicate hand-out. Strict (exactly-once) spec fails immediately (trace below).
+H2 (a) AddVsComplete         OK. Only (true, notified once) and (false, self-called once).
+H2 (b) TwoContinueWith...    OK. Every waiter exactly once (3.9e9 samples in default mode).
+H2 (c) LastOrdering          OK. 13 distinct orders, L always after every notified waiter.
+H2 (d) TryRunVsTryRun        OK. Exactly one winner.
+H2 (e) MarkRunnableVsComplete  FAILED: FORBIDDEN "1, 0, 0, 1" in 2.0-2.4% of samples, every JVM configuration:
+                             DONE_FLAG set, NOT_RUNNABLE clear, isDone() false, and a later tryRun wins.
+H2 (e') TryMarkRunnable...   OK (control: tryUpdateState re-checks DONE inside the CAS loop).
+H2 (f) complete vs complete  Not a jcstress test: the loser calls logAndDie, which either exits the fork (121) or,
+                             here, sets the static inLogAndDie guard for the rest of the VM (F1b), so jcstress
+                             cannot keep using the fork. Stays a child-JVM probe (W3c, T7).
+
+New finding (H2 e): NodeTask.markAsRunnable is check-then-act on _state.
+  if (!isDoneOrRunnable()) updateState(0, STATE_NOT_RUNNABLE);   // NodeTask.java:762
+updateState is an unconditional CAS loop, so a complete() that lands between the check and the CAS has its
+STATE_NOT_RUNNABLE cleared: state 0x5 (STARTED|DONE_FLAG). isDone() is then false on a completed node,
+isRunnable() true, and the caller (onChildCompleted -> markAsRunnable; eq.enqueue(this)) enqueues it; the
+worker's tryRun succeeds, so run() executes again on a completed node and its second completion goes to
+logAndDie (exit 121, or the F1b silent swallow). run.sh h2e replays that interleaving deterministically:
+  markAsRunnable check passed before complete: true
+  after race: state=0x5 isDone()=false isDoneEx()=true isRunnable()=true
+  tryRun: prev NOT_RUNNABLE clear = true (scheduler would run the node again)
+  after tryRun: state=0x7 isDone()=true (tryRun re-set NOT_RUNNABLE, so the re-run's completion is detected)
+  second complete(): logAndDie entered = true; state=0x7 isDone()=true
+Needs a node that completes while one of its own child subscriptions fires concurrently: a waiting node
+completed by another thread (detectCyclesAndRecover completes a node in the middle of a wait chain;
+cancellation / tryCompleteWithException from a non-graph thread) or markAsRunnableAndEnqueue racing a
+completion ("helps plugins that enqueue nodes twice"). Fix: use tryUpdateState (as tryMarkAsRunnable does),
+which the control test (e') shows is race-free.
+
+Lincheck finding (strict trace below): growArray can move _base backwards by more than one. Thieves steal
+T0, T1, T2 (base 0 -> 3) while the owner's growArray is copying; the swap writes _base = 1 and resurrects T1
+and T2 in the new array, both of which are later handed out again (pop 3, steal 1, scan 2). W1d saw one
+resurrected task; this shows several at once, so size() can overstate pending work by up to the number of
+steals that overlap the copy. No loss in any configuration.
+
+Testability findings:
+- jcstress forks accept the entity agent through -jvmArgsPrepend without trouble.
+- Lincheck 2.39 (dynamic ByteBuddy agent) cannot instrument the agent-rewritten NodeTask: "Unable to transform
+  optimus/graph/NodeTask ... IllegalStateException: Internal error: can't find field with m2 in class
+  optimus/core/TPDMask". The entity agent's TPDMaskTransfomer adds fields m2.. to TPDMask at load time, and
+  Lincheck's FinalFields reads the untransformed class file. NodeTask therefore runs uninstrumented (no
+  switch points inside it). This does not matter for the WorkQueue model (tasks are passive; every shared
+  access is in OGSchedulerContext$WorkQueue, which is instrumented, as the traces show), but it rules out
+  Lincheck for H2, which is why H2 is jcstress only.
+- Lincheck's linearizability checker cannot express at-least-once delivery, so H1Lincheck uses a custom
+  Verifier (AtLeastOnceVerifier): a DFS over linearizations consistent with Lincheck's happens-before clocks
+  against a nondeterministic spec (push at top; pop top / steal bottom / scan topmost takeable with removeAt's
+  bottom-into-slot move; any consumer may also return an already-delivered id; "none" only when the spec has
+  nothing to take), plus a no-loss check of the final spec state against the real queue's live region read via
+  @StateRepresentation. Duplicates are allowed at any time, which is weaker than "only while a concurrent
+  consumer holds it"; tightening that is future work.
+
+=================== jcstress -m quick, all tests (results/jcstress-quick-20261016-100608) ===================
+RUN RESULTS:
+  Interesting tests: 3 matching test results.
+
+.......... [OK] optimus.graph.H1WorkQueue.GrowVsSteal
+
+  Results across all configurations:
+
+          RESULT    SAMPLES     FREQ       EXPECT  DESCRIPTION
+    -1, 0, 0, 64          0    0.00%   Acceptable  no steal
+     0, 0, 0, 63  7,289,325   99.91%   Acceptable  steal of T0, clean
+     0, 0, 1, 64      6,465    0.09%  Interesting  T0 stolen from old array after copy, resurrected in new a...
+  [-0-9]+, 0, .*          0    0.00%  Interesting  no loss, other shape
+
+.......... [OK] optimus.graph.H1WorkQueue.PopVsSteal
+
+  Results across all configurations:
+
+      RESULT     SAMPLES     FREQ       EXPECT  DESCRIPTION
+    0, 0, .*           0    0.00%    Forbidden  task lost: neither got it
+  0, 1, 0, 1  13,831,717   17.67%   Acceptable  thief only
+  1, 0, 0, 1  64,220,162   82.05%   Acceptable  owner only
+    1, 1, .*           0    0.00%  Interesting  both, with an unexpected final size
+  1, 1, 0, 1     220,949    0.28%  Interesting  both (R7 stale localPop return; tryRun CAS must arbitrate)
+
+.......... [OK] optimus.graph.H1WorkQueue.ScanVsStealBase
+
+  Results across all configurations:
+
+                  RESULT     SAMPLES     FREQ       EXPECT  DESCRIPTION
+              0, 1, 0, 0  12,526,397   25.19%   Acceptable  thief got M, scan found nothing
+              1, 0, 0, 0           0    0.00%   Acceptable  scan got M, thief got nothing
+              1, 1, 0, 0     695,150    1.40%  Interesting  M handed out twice (W1e/R7)
+              1, 2, 0, 0  36,508,671   73.41%   Acceptable  scan got M, thief got another task
+      [0-2], [0-2], 0, 0           0    0.00%  Interesting  no loss, other combination
+  [0-2], [0-2], 0, [1-9]           0    0.00%    Forbidden  null hole in live region
+
+  Failed tests: 1 matching test results.
+
+...... [FAILED] optimus.graph.H2Waiters.MarkRunnableVsComplete
+
+  Results across all configurations:
+
+      RESULT      SAMPLES     FREQ      EXPECT  DESCRIPTION
+  1, 0, 0, 1    3,037,311    2.00%   Forbidden  DONE_FLAG set but runnable: isDone() false, tryRun wins o...
+  1, 1, 1, 0  148,850,573   98.00%  Acceptable  done, not runnable
+
+  Error tests: No matches.
+
+  All remaining tests: 7 matching test results.
+
+.......... [OK] optimus.graph.H1WorkQueue.ScanVsStealMid
+
+  Results across all configurations:
+
+                  RESULT     SAMPLES     FREQ       EXPECT  DESCRIPTION
+              0, 1, 0, 0           0    0.00%  Interesting  thief got M (after removeAt moved it to base?)
+              1, 1, 0, 0           0    0.00%  Interesting  M handed out twice
+              1, 2, 0, 0  51,797,573  100.00%   Acceptable  scan got M, thief got another task
+      [0-2], [0-2], 0, 0           0    0.00%  Interesting  no loss, other combination
+  [0-2], [0-2], 0, [1-9]           0    0.00%    Forbidden  null hole in live region
+
+.......... [OK] optimus.graph.H1WorkQueue.WrapPushPopVsTwoThieves
+
+  Results across all configurations:
+
+                  RESULT      SAMPLES     FREQ       EXPECT  DESCRIPTION
+              0, 0, 0, 0  101,834,935  100.00%   Acceptable  every task delivered or queued exactly once
+         0, 0, [0-9]+, 2            0    0.00%  Interesting  phantom: isEmpty() false with nothing live
+  0, [1-9], [0-9]+, [02]            0    0.00%  Interesting  double hand-out, no loss
+
+.......... [OK] optimus.graph.H2Waiters.AddVsComplete
+
+  Results across all configurations:
+
+   RESULT     SAMPLES     FREQ      EXPECT  DESCRIPTION
+  0, 0, 1  72,919,137   48.23%  Acceptable  too late, caller called it itself
+  1, 1, 0  78,280,785   51.77%  Acceptable  registered, notified once
+
+.......... [OK] optimus.graph.H2Waiters.LastOrdering
+
+  Results across all configurations:
+
+  RESULT     SAMPLES     FREQ      EXPECT  DESCRIPTION
+  BAD:.*           0    0.00%   Forbidden  ordering or exactly-once violated
+  OK:0La  13,252,164    8.68%  Acceptable  Last waiter after every listed waiter
+  OK:0aL     354,583    0.23%  Acceptable  Last waiter after every listed waiter
+  OK:0al  15,077,019    9.88%  Acceptable  Last waiter after every listed waiter
+  OK:0la  17,788,720   11.66%  Acceptable  Last waiter after every listed waiter
+  OK:A0L  88,805,281   58.19%  Acceptable  Last waiter after every listed waiter
+  OK:A0l  16,320,300   10.69%  Acceptable  Last waiter after every listed waiter
+  OK:Al0     539,824    0.35%  Acceptable  Last waiter after every listed waiter
+  OK:a0L      54,809    0.04%  Acceptable  Last waiter after every listed waiter
+  OK:a0l      48,059    0.03%  Acceptable  Last waiter after every listed waiter
+  OK:al0       6,185   <0.01%  Acceptable  Last waiter after every listed waiter
+  OK:l0a     153,698    0.10%  Acceptable  Last waiter after every listed waiter
+  OK:lA0     213,969    0.14%  Acceptable  Last waiter after every listed waiter
+  OK:la0      10,675   <0.01%  Acceptable  Last waiter after every listed waiter
+
+.......... [OK] optimus.graph.H2Waiters.TryMarkRunnableVsComplete
+
+  Results across all configurations:
+
+      RESULT      SAMPLES     FREQ      EXPECT  DESCRIPTION
+  1, 1, 1, 0  168,664,793  100.00%  Acceptable  done, not runnable
+
+.......... [OK] optimus.graph.H2Waiters.TryRunVsTryRun
+
+  Results across all configurations:
+
+  RESULT     SAMPLES     FREQ      EXPECT  DESCRIPTION
+    0, 1  63,657,203   44.66%  Acceptable  exactly one winner
+    1, 0  78,867,004   55.34%  Acceptable  exactly one winner
+
+.......... [OK] optimus.graph.H2Waiters.TwoContinueWithVsComplete
+
+  Results across all configurations:
+
+  RESULT      SAMPLES     FREQ      EXPECT  DESCRIPTION
+    1, 1  223,965,473  100.00%  Acceptable  each waiter called once
+
+  HTML report generated at /Users/jzaugg-virtus/code/.worktrees/optimus-cirrus/cirrus-scheduler-review-faa430/probes/modelcheck/results/jcstress-quick-20261016-100608/report/index.html
+
+=================== jcstress -m default, interesting tests (results/jcstress-default-20261016-100916) ===================
+RUN RESULTS:
+  Interesting tests: 3 matching test results.
+
+.......... [OK] optimus.graph.H1WorkQueue.GrowVsSteal
+
+  Results across all configurations:
+
+          RESULT     SAMPLES     FREQ       EXPECT  DESCRIPTION
+    -1, 0, 0, 64           0    0.00%   Acceptable  no steal
+     0, 0, 0, 63  53,191,915   99.81%   Acceptable  steal of T0, clean
+     0, 0, 1, 64     102,479    0.19%  Interesting  T0 stolen from old array after copy, resurrected in new a...
+  [-0-9]+, 0, .*           0    0.00%  Interesting  no loss, other shape
+
+.......... [OK] optimus.graph.H1WorkQueue.PopVsSteal
+
+  Results across all configurations:
+
+      RESULT      SAMPLES     FREQ       EXPECT  DESCRIPTION
+    0, 0, .*            0    0.00%    Forbidden  task lost: neither got it
+  0, 1, 0, 1  147,574,143   15.64%   Acceptable  thief only
+  1, 0, 0, 1  793,796,693   84.11%   Acceptable  owner only
+    1, 1, .*            0    0.00%  Interesting  both, with an unexpected final size
+  1, 1, 0, 1    2,421,938    0.26%  Interesting  both (R7 stale localPop return; tryRun CAS must arbitrate)
+
+.......... [OK] optimus.graph.H1WorkQueue.ScanVsStealBase
+
+  Results across all configurations:
+
+                  RESULT      SAMPLES     FREQ       EXPECT  DESCRIPTION
+              0, 1, 0, 0  200,441,581   28.33%   Acceptable  thief got M, scan found nothing
+              1, 0, 0, 0            0    0.00%   Acceptable  scan got M, thief got nothing
+              1, 1, 0, 0   14,869,807    2.10%  Interesting  M handed out twice (W1e/R7)
+              1, 2, 0, 0  492,111,466   69.56%   Acceptable  scan got M, thief got another task
+      [0-2], [0-2], 0, 0            0    0.00%  Interesting  no loss, other combination
+  [0-2], [0-2], 0, [1-9]            0    0.00%    Forbidden  null hole in live region
+
+  Failed tests: 1 matching test results.
+
+...... [FAILED] optimus.graph.H2Waiters.MarkRunnableVsComplete
+
+  Results across all configurations:
+
+      RESULT        SAMPLES     FREQ      EXPECT  DESCRIPTION
+  1, 0, 0, 1     51,077,509    2.42%   Forbidden  DONE_FLAG set but runnable: isDone() false, tryRun wins o...
+  1, 1, 1, 0  2,058,877,185   97.58%  Acceptable  done, not runnable
+
+  Error tests: No matches.
+
+  All remaining tests: 4 matching test results.
+
+.......... [OK] optimus.graph.H1WorkQueue.WrapPushPopVsTwoThieves
+
+  Results across all configurations:
+
+                  RESULT        SAMPLES     FREQ       EXPECT  DESCRIPTION
+              0, 0, 0, 0  1,629,202,702  100.00%   Acceptable  every task delivered or queued exactly once
+         0, 0, [0-9]+, 2              0    0.00%  Interesting  phantom: isEmpty() false with nothing live
+  0, [1-9], [0-9]+, [02]              0    0.00%  Interesting  double hand-out, no loss
+
+.......... [OK] optimus.graph.H2Waiters.AddVsComplete
+
+  Results across all configurations:
+
+   RESULT        SAMPLES     FREQ      EXPECT  DESCRIPTION
+  0, 0, 1  1,254,568,807   50.41%  Acceptable  too late, caller called it itself
+  1, 1, 0  1,234,009,887   49.59%  Acceptable  registered, notified once
+
+.......... [OK] optimus.graph.H2Waiters.LastOrdering
+
+  Results across all configurations:
+
+  RESULT        SAMPLES     FREQ      EXPECT  DESCRIPTION
+  BAD:.*              0    0.00%   Forbidden  ordering or exactly-once violated
+  OK:0La    173,302,721    6.39%  Acceptable  Last waiter after every listed waiter
+  OK:0aL      7,457,037    0.27%  Acceptable  Last waiter after every listed waiter
+  OK:0al    354,321,697   13.06%  Acceptable  Last waiter after every listed waiter
+  OK:0la    395,940,499   14.59%  Acceptable  Last waiter after every listed waiter
+  OK:A0L  1,486,959,110   54.80%  Acceptable  Last waiter after every listed waiter
+  OK:A0l    275,580,848   10.16%  Acceptable  Last waiter after every listed waiter
+  OK:Al0      9,574,510    0.35%  Acceptable  Last waiter after every listed waiter
+  OK:a0L      1,277,778    0.05%  Acceptable  Last waiter after every listed waiter
+  OK:a0l      1,107,996    0.04%  Acceptable  Last waiter after every listed waiter
+  OK:al0        123,422   <0.01%  Acceptable  Last waiter after every listed waiter
+  OK:l0a      3,179,068    0.12%  Acceptable  Last waiter after every listed waiter
+  OK:lA0      4,314,978    0.16%  Acceptable  Last waiter after every listed waiter
+  OK:la0        212,798   <0.01%  Acceptable  Last waiter after every listed waiter
+
+.......... [OK] optimus.graph.H2Waiters.TwoContinueWithVsComplete
+
+  Results across all configurations:
+
+  RESULT        SAMPLES     FREQ      EXPECT  DESCRIPTION
+    1, 1  3,914,361,102  100.00%  Acceptable  each waiter called once
+
+  HTML report generated at /Users/jzaugg-virtus/code/.worktrees/optimus-cirrus/cirrus-scheduler-review-faa430/probes/modelcheck/results/jcstress-default-20261016-100916/report/index.html
+
+=================== jcstress -m default, WrapTight (results/jcstress-default-20261016-101854) ===================
+RUN RESULTS:
+  Interesting tests: 1 matching test results.
+
+.......... [OK] optimus.graph.H1WorkQueue.WrapTightPushPopVsTwoThieves
+
+  Results across all configurations:
+
+                  RESULT        SAMPLES     FREQ       EXPECT  DESCRIPTION
+              0, 0, 0, 0  2,639,979,493   99.98%   Acceptable  every task delivered or queued exactly once
+         0, 0, [0-9]+, 2              0    0.00%  Interesting  phantom: isEmpty() false with nothing live
+              0, 1, 0, 0        576,809    0.02%  Interesting  double hand-out, no loss
+
+  Failed tests: No matches.
+
+  Error tests: No matches.
+
+  All remaining tests: No matches.
+
+
+  HTML report generated at /Users/jzaugg-virtus/code/.worktrees/optimus-cirrus/cirrus-scheduler-review-faa430/probes/modelcheck/results/jcstress-default-20261016-101854/report/index.html
+
+=================== Lincheck, at-least-once spec (results/lincheck-final.log) ===================
+=== Lincheck model checking: grow (capacity 4, start 0), 150 iterations x 10000 invocations, 3 threads x 3 actors
+=== grow: PASSED
+=== grow: 1520000 executions verified (1520000 with final-state check), 44326 needed a duplicate hand-out to linearize; 174.0s
+=== Lincheck model checking: plain (capacity 64, start 0), 150 iterations x 10000 invocations, 3 threads x 3 actors
+=== plain: PASSED
+=== plain: 1520000 executions verified (1520000 with final-state check), 39127 needed a duplicate hand-out to linearize; 241.5s
+=== Lincheck model checking: wrap (capacity 4, start 2147483642), 150 iterations x 10000 invocations, 3 threads x 3 actors
+=== wrap: PASSED
+=== wrap: 1520000 executions verified (1520000 with final-state check), 43907 needed a duplicate hand-out to linearize; 163.7s
+(the only error output in the log is the one 'Unable to transform optimus/graph/NodeTask' stack trace above)
+
+=================== Lincheck, strict exactly-once spec (results/lincheck-strict.txt), first failure ===================
+= Invalid execution results =
+| --------------------------------------------------- |
+|     Thread 1      |  Thread 2  |      Thread 3      |
+| --------------------------------------------------- |
+| push(): 0         |            |                    |
+| push(): 1         |            |                    |
+| push(): 2         |            |                    |
+| --------------------------------------------------- |
+| STATE: [0,1,2] top=3 base=0                         |
+| --------------------------------------------------- |
+| push(): 3         | steal(): 0 | steal(): 2 [0,2,0] |
+| push(): 4 [1,2,1] | steal(): 1 |                    |
+| pop(): 4 [2,2,1]  |            |                    |
+| --------------------------------------------------- |
+| STATE: [1,2,3] top=4 base=1                         |
+| --------------------------------------------------- |
+| pop(): 3          |            |                    |
+| steal(): 1        |            |                    |
+| scan(): 2         |            |                    |
+| pop(): -1         |            |                    |
+| --------------------------------------------------- |
+| STATE: [] top=3 base=3                              |
+| --------------------------------------------------- |
+
+---
+All operations above the horizontal line | ----- | happen before those below the line
+---
+Values in "[..]" brackets indicate the number of completed operations
+(full interleaving and detailed trace in results/lincheck-strict.txt)
