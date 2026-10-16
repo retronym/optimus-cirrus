@@ -87,3 +87,12 @@ XS/XSFT: T1, T13, T16, W9, W10 and the XS branch of H2 only; the `ips` protocol 
 ## Exit criteria
 
 Every D/R candidate graded H or M has a probe result; every W property has a probe that tried to falsify it; the fuzzers have run their full sweeps; the review is updated with results, withdrawals and new ids; `probes/cache/RESULTS-*.txt` hold the raw lines; everything is committed and pushed.
+
+## Status
+
+- P0 fixtures: done (`probes/cache/FIXTURES.md`, smoke 100/100).
+- Tier 0: all 14 run (W3/W11 as jcstress). Demonstrated: W1 (at width 2/0), W2, W5, W6, W7, W8, W9, W10, W11, W12, W14; quantified: W4, W13; W3 held.
+- Tier 1: all 19 run. Demonstrated: T1, T2, T3, T4a/b, T5, T6, T7, T8, T10, T12, T13, T14, T15, T16, T17, T18; not reproduced: T4c, T9; quantified: T11, T19 (held).
+- Tier 2: H1 done (strict spec fails 3 ways, relaxed passes 354 k), H2 and H3 swept (480 + 1,200 runs), H4 soak in progress.
+- Findings added by Phase 2: D15, D16, D17, D18, D19, F18, F19. Withdrawn/downgraded: R7, R9, the resize leak direction, the R4→D6 reading of D18.
+- Open: the XS + bind "Inconsistent TweakTreeNodes" assert (H2, 12 runs); the XSFT `ips` protocol model (promoted by W9 failing, not built); T4d and R7's expansion path (need a tweak-translator fixture).
