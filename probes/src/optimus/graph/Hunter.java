@@ -1282,6 +1282,278 @@ public final class Hunter {
     Runtime.getRuntime().halt(0);
   }
 
+
+  // ================================================================== H10 soak (one long-lived JVM, fresh seeds, thread churn)
+
+  static final Field F_TC = field(OGScheduler.class, "threadCounter");
+
+  /** Max WorkQueue._top over every context the hunter knows (clients, workers, waiters, idle) and the global quick queue. */
+  static int maxTop(OGScheduler s) throws Exception {
+    int m = F_WQ_TOP.getInt(F_QQ.get(s));
+    List<OGScheduler.Context> cs = new ArrayList<>();
+    for (Field f : new Field[] {F_WORKERS, F_WAITERS, F_IDLE}) cs.addAll(Arrays.asList(contexts(s, f)));
+    for (OGSchedulerContext sc : HunterH4.byTid.values()) cs.add(HunterH4.ctxOf(sc));
+    for (OGScheduler.Context c : cs) if (c != null) m = Math.max(m, F_WQ_TOP.getInt(c.queue));
+    return m;
+  }
+
+  static void soakChild(long firstSeed, String cfg, long durationSec) throws Exception {
+    long wdMs = Long.getLong("hunter.wdMs", 10_000);
+    long budgetMs = Long.getLong("hunter.budgetMs", 2000);
+    int maxIters = Integer.getInteger("hunter.iters", 200), minIters = Integer.getInteger("hunter.minIters", 3);
+    EvaluationContext.initializeWithoutRuntime();
+    OGScheduler s = (OGScheduler) EvaluationContext.scheduler();
+    ScenarioStack base = EvaluationContext.scenarioStack();
+    int sid = F_SID.getInt(s);
+    System.out.println("KV soak firstSeed=" + firstSeed + " cfg=" + cfg + " ideal=" + F_IDEAL.getInt(s) + " limitThreads=" + Settings.limitThreads
+        + " asserts=" + Settings.schedulerAsserts + " delayMaxNanos=" + Long.getLong("probes.delay.maxNanos", 0) + " threadCounter=" + F_TC.get(s));
+    AtomicInteger extN = new AtomicInteger();
+    ScheduledThreadPoolExecutor ext = new ScheduledThreadPoolExecutor(3, r -> {
+      Thread t = new Thread(() -> {
+        EvaluationContext.initializeWithoutRuntime();
+        r.run();
+      }, "hunter-ext-" + extN.incrementAndGet());
+      t.setDaemon(true);
+      return t;
+    });
+    ext.setRemoveOnCancelPolicy(true);
+    long t0 = System.nanoTime(), lastStat = 0;
+    for (long seed = firstSeed; (System.nanoTime() - t0) / 1_000_000_000L < durationSec; seed++) {
+      Spec sp = generate(seed, 0);
+      int f0 = findingCount.get();
+      findings.clear();
+      // fresh client threads for every seed: a request pool that churns threads (each one initialises an
+      // EvaluationContext and takes a new id from threadCounter, as production threads do)
+      List<ArrayBlockingQueue<Job>> qs = new ArrayList<>();
+      List<Thread> clients = new ArrayList<>();
+      for (int c = 0; c < sp.clients; c++) {
+        ArrayBlockingQueue<Job> q = new ArrayBlockingQueue<>(1);
+        qs.add(q);
+        int ci = c;
+        Thread t = new Thread(() -> {
+          EvaluationContext.initializeWithoutRuntime();
+          OGSchedulerContext ec = OGSchedulerContext.current();
+          while (true) {
+            Job j;
+            try {
+              j = q.take();
+            } catch (InterruptedException e) {
+              return;
+            }
+            try {
+              ec.runAndWait(j.g.nodes[j.root]);
+            } catch (Throwable e) {
+              finding("CLIENT_THREW", "client " + ci + " " + e);
+            } finally {
+              j.done.countDown();
+            }
+          }
+        }, "hunter-client-" + c);
+        t.setDaemon(true);
+        t.start();
+        clients.add(t);
+      }
+      long ts0 = System.nanoTime(), maxMs = 0;
+      int iter;
+      List<String> h5 = new ArrayList<>();
+      for (iter = 0; iter < maxIters; iter++) {
+        curIter = iter;
+        if (iter >= minIters && (System.nanoTime() - ts0) / 1_000_000 > budgetMs) break;
+        G g = new G(sp, s, ext, base);
+        Random ir = new Random(seed ^ (iter * 0x632BE59BD9B4E019L));
+        List<ScheduledFuture<?>> cancels = new ArrayList<>();
+        for (int k = 0; k < sp.scopeRoot.length; k++) {
+          var cs = g.scopeSS[k].cancelScope();
+          long d = (long) (sp.cancelDelayUs[k] * (0.25 + 1.5 * ir.nextDouble()));
+          cancels.add(ext.schedule(() -> cs.cancel("hunter cancel"), d, TimeUnit.MICROSECONDS));
+        }
+        CountDownLatch done = new CountDownLatch(sp.clients);
+        long ts = System.nanoTime();
+        for (int c = 0; c < sp.clients; c++) {
+          g.nodes[sp.clientRoot[c]].enqueued = true;
+          qs.get(c).put(new Job(g, sp.clientRoot[c], done));
+        }
+        if (!done.await(wdMs, TimeUnit.MILLISECONDS)) {
+          snapshot(g, s, "soak seed " + seed + " clients not done (iter " + iter + ")", wdMs, false);
+
+          System.out.println("SOAK-RESULT seed=" + seed + " class=HANG iters=" + iter + " findings=" + String.join(",", findingKinds()));
+          soakStat(s, sid, t0, seed, true);
+          System.out.flush();
+          Runtime.getRuntime().halt(3);
+        }
+        maxMs = Math.max(maxMs, (System.nanoTime() - ts) / 1_000_000);
+        for (ScheduledFuture<?> f : cancels)
+          if (!f.cancel(false)) {
+            try {
+              f.get(2, TimeUnit.SECONDS);
+            } catch (Exception ignored) {
+            }
+          }
+        long tw = System.nanoTime();
+        while (g.extOutstanding.get() > 0 && (System.nanoTime() - tw) < 5_000_000_000L) Thread.sleep(1);
+        if (g.extOutstanding.get() > 0) finding("EXT_OUTSTANDING", "" + g.extOutstanding.get());
+        checkGraph(g);
+        Acct a = settle(s, 2000);
+        List<String> v = a.violations();
+        if (!v.isEmpty()) {
+          String key = String.join(",", v.stream().map(x -> x.replaceAll("=.*", "")).toList());
+          if (!h5.contains(key)) {
+            h5.add(key);
+            finding("H5", String.join(" ", v) + " | " + a);
+          }
+        }
+      }
+      for (Thread t : clients) t.interrupt();
+      for (Thread t : clients) t.join(2000);
+      HunterH4.purge();
+      List<String> fk = findingKinds();
+      boolean oracle = fk.stream().anyMatch(k -> !k.equals("H5") && !k.equals("SLOW_ITER") && !k.equals("TIMER_RECOVERED_LOST_WAKEUP"));
+      String cls = oracle ? "ORACLE" : fk.contains("H5") ? "H5" : maxMs >= 900 ? "PASS-SLOW" : "PASS";
+      System.out.println("SOAK-RESULT seed=" + seed + " class=" + cls + " iters=" + iter + " maxIterMs=" + maxMs + " N=" + sp.n + " clients=" + sp.clients
+          + " findings=" + String.join(",", fk) + " newFindings=" + (findingCount.get() - f0));
+      if ((System.nanoTime() - t0) / 1_000_000_000L - lastStat >= 30) {
+        lastStat = (System.nanoTime() - t0) / 1_000_000_000L;
+        soakStat(s, sid, t0, seed, false);
+      }
+    }
+    soakStat(s, sid, t0, -1, false);
+    System.out.println("SOAK-END");
+    System.out.flush();
+    Runtime.getRuntime().halt(0);
+  }
+
+  static List<String> findingKinds() {
+    List<String> fk = new ArrayList<>();
+    for (String f : findings) {
+      String k = f.split(" ")[1];
+      if (!fk.contains(k)) fk.add(k);
+    }
+    return fk;
+  }
+
+  static void soakStat(OGScheduler s, int sid, long t0, long seed, boolean hung) {
+    try {
+      if (!hung) {
+        System.gc();
+        System.gc();
+      }
+      Runtime rt = Runtime.getRuntime();
+      long heap = (rt.totalMemory() - rt.freeMemory()) / (1024 * 1024);
+      int cb = ((java.util.PriorityQueue<?>) F_CB.get(s)).size();
+      int q = ((java.util.PriorityQueue<?>) F_Q.get(s)).size();
+      int tracked = ((optimus.core.IndexedArrayList<?>) F_TRACKED.get(s)).count;
+      int idle = ((OGScheduler.Contexts) F_IDLE.get(s)).count;
+      int live = Thread.getAllStackTraces().size();
+      System.out.println("SOAKSTAT upSec=" + (System.nanoTime() - t0) / 1_000_000_000L + " seed=" + seed + " heapMB" + (hung ? "(noGC)" : "AfterGC") + "=" + heap
+          + " ogLive=" + ogWorkers(sid).size() + " idle=" + idle + " liveThreads=" + live + " onStalledCallbacks=" + cb + " queue=" + q + " tracked=" + tracked
+          + " threadCounter=" + F_TC.get(s) + " maxTop=" + maxTop(s) + " h4ctx=" + HunterH4.byTid.size() + " " + HunterH4.summary().replace(' ', ','));
+    } catch (Throwable t) {
+      System.out.println("SOAKSTAT error " + t);
+    }
+  }
+
+  /** Parent: one driver per cfg; restarts the soak JVM at the next seed after a hang. */
+  static void soak(long firstSeed, int minutes, List<String> cfgs) throws Exception {
+    long deadline = System.nanoTime() + minutes * 60_000_000_000L, t0 = System.nanoTime();
+    String cmd = System.getenv("HUNTER_JAVA_CMD");
+    record Win(int[] counts, Map<String, Integer> cls, String[] lastStat) {}
+    Map<String, List<Win>> wins = new java.util.concurrent.ConcurrentHashMap<>();
+    List<Thread> drivers = new ArrayList<>();
+    for (String cfg : cfgs) {
+      List<Win> w = java.util.Collections.synchronizedList(new ArrayList<>());
+      wins.put(cfg, w);
+      Thread d = new Thread(() -> {
+        long seed = firstSeed;
+        int segment = 0;
+        try {
+          while (System.nanoTime() < deadline) {
+            long rem = (deadline - System.nanoTime()) / 1_000_000_000L;
+            if (rem < 5) break;
+            List<String> argv = new ArrayList<>(List.of("java"));
+            for (String f : flags(cfg).split(" ")) if (!f.isEmpty()) argv.add(f);
+            for (String k : new String[] {"hunter.budgetMs", "hunter.iters", "hunter.minIters", "hunter.wdMs", "hunter.h4"})
+              if (System.getProperty(k) != null) argv.add("-D" + k + "=" + System.getProperty(k));
+            for (String a : cmd.substring(5).trim().split("\\s+")) argv.add(a);
+            argv.addAll(List.of("--soak", Long.toString(seed), cfg, Long.toString(rem)));
+            Path log = logDir().resolve("soak-" + cfg + "-seg" + segment + "-s" + seed + ".log");
+            Process p = new ProcessBuilder(argv).redirectErrorStream(true).start();
+            long lastSeed = seed - 1;
+            try (var out = Files.newBufferedWriter(log); var in = new java.io.BufferedReader(new java.io.InputStreamReader(p.getInputStream()))) {
+              String l;
+              while ((l = in.readLine()) != null) {
+                out.write(l);
+                out.newLine();
+                int wi = (int) ((System.nanoTime() - t0) / 600_000_000_000L);
+                while (w.size() <= wi) w.add(new Win(new int[4], new TreeMap<>(), new String[1]));
+                Win cur = w.get(wi);
+                if (l.startsWith("SOAK-RESULT ")) {
+                  Map<String, String> kv = kvs(List.of("KV " + l.substring(12)));
+                  lastSeed = Long.parseLong(kv.get("seed"));
+                  String c = kv.get("class");
+                  synchronized (cur) {
+                    cur.counts[c.startsWith("PASS") ? 0 : c.equals("HANG") ? 1 : 2]++;
+                    cur.cls.merge(c + (c.equals("PASS") ? "" : "{" + kv.get("findings") + "}"), 1, Integer::sum);
+                  }
+                  synchronized (System.out) {
+                    System.out.println("RESULT soak cfg=" + cfg + " seg=" + segment + " " + l.substring(12));
+                  }
+                } else if (l.startsWith("SOAKSTAT ")) {
+                  cur.lastStat[0] = "seg=" + segment + " " + l.substring(9);
+                  synchronized (System.out) {
+                    System.out.println("STAT soak cfg=" + cfg + " seg=" + segment + " " + l.substring(9));
+                  }
+                } else if (l.startsWith("HANG-CLASS") || l.startsWith("STALL-CLASS") || l.startsWith("H4 SELF_WAIT where") || l.startsWith("H4 WAIT_CYCLE")
+                    || l.startsWith("FINDING ") || l.startsWith("CHILD-ERROR")) {
+                  synchronized (System.out) {
+                    System.out.println("EVENT soak cfg=" + cfg + " seg=" + segment + " seed=" + (lastSeed + 1) + " " + (l.length() > 400 ? l.substring(0, 400) : l));
+                  }
+                }
+              }
+            }
+            p.waitFor();
+            if (p.exitValue() != 0 && p.exitValue() != 3) synchronized (System.out) {
+              System.out.println("EVENT soak cfg=" + cfg + " seg=" + segment + " exit=" + p.exitValue());
+            }
+            if (p.exitValue() == 3) lastSeed++; // the hung seed reported its own SOAK-RESULT
+            seed = Math.max(seed, lastSeed + 1);
+            segment++;
+          }
+        } catch (Exception e) {
+          e.printStackTrace(System.out);
+        }
+      }, "soak-" + cfg);
+      d.start();
+      drivers.add(d);
+    }
+    // per-10-minute window summary, printed as windows close
+    int printed = 0;
+    while (drivers.stream().anyMatch(Thread::isAlive)) {
+      Thread.sleep(5000);
+      int closed = (int) ((System.nanoTime() - t0) / 600_000_000_000L);
+      for (; printed < closed; printed++) printWindow(wins, printed);
+    }
+    int total = (int) ((System.nanoTime() - t0) / 600_000_000_000L) + 1;
+    for (; printed < total; printed++) printWindow(wins, printed);
+  }
+
+  static void printWindow(Map<String, ? extends List<?>> wins, int wi) {
+    for (var e : new TreeMap<>(wins).entrySet()) {
+      List<?> w = e.getValue();
+      if (w.size() <= wi) continue;
+      Object o = w.get(wi);
+      try {
+        int[] c = (int[]) o.getClass().getMethod("counts").invoke(o);
+        Object cls = o.getClass().getMethod("cls").invoke(o);
+        String[] st = (String[]) o.getClass().getMethod("lastStat").invoke(o);
+        System.out.println("SOAK-WINDOW cfg=" + e.getKey() + " minutes=" + (wi * 10) + "-" + (wi * 10 + 10) + " pass=" + c[0] + " hang=" + c[1] + " other=" + c[2]
+            + " classes=" + cls + " lastStat=[" + st[0] + "]");
+      } catch (Exception x) {
+        System.out.println("SOAK-WINDOW error " + x);
+      }
+    }
+    System.out.flush();
+  }
+
   // ================================================================== parent
 
   static String flags(String cfg) {
@@ -1410,7 +1682,7 @@ public final class Hunter {
       alias += Long.parseLong(k.getOrDefault("h4aliased." + p, "0"));
       per.append(p).append(':').append(st).append('/').append(k.getOrDefault("h4take." + p, "0")).append(',');
     }
-    return "h4=[staleTake=" + stale + " sameDepth=" + same + " popped=" + popped + " r9AtTake=" + r9 + " selfWait=" + k.get("h4selfWait.wait") + "+" + k.get("h4selfWait.timer")
+    return "h4=[staleTake=" + stale + " sameDepth=" + same + " popped=" + popped + " r9AtTake=" + r9 + " selfWait=" + k.get("h4selfWait.wait") + "+" + k.get("h4selfWait.timer") + " waitCycle=" + k.get("h4waitCycle.timer")
         + " aliased=" + alias + " unknown=" + unk + " stale/take=" + per.substring(0, per.length() - 1) + "]";
   }
 
@@ -1541,6 +1813,17 @@ public final class Hunter {
   }
 
   public static void main(String[] args) throws Exception {
+    if (args.length >= 4 && args[0].equals("--soak")) {
+      try {
+        soakChild(Long.parseLong(args[1]), args[2], Long.parseLong(args[3]));
+      } catch (Throwable t) {
+        System.out.println("CHILD-ERROR " + t);
+        t.printStackTrace(System.out);
+        System.out.flush();
+        Runtime.getRuntime().halt(4);
+      }
+      return;
+    }
     if (args.length >= 1 && args[0].equals("--inv")) {
       inv();
       return;
@@ -1559,6 +1842,8 @@ public final class Hunter {
     if (args.length >= 3 && args[0].equals("sweep")) sweep(Long.parseLong(args[1]), Integer.parseInt(args[2]));
     else if (args.length >= 3 && args[0].equals("one"))
       one(Long.parseLong(args[1]), args[2], args.length > 3 ? Integer.parseInt(args[3]) : 0, args.length > 4 ? Integer.parseInt(args[4]) : 1);
+    else if (args.length >= 4 && args[0].equals("soak"))
+      soak(Long.parseLong(args[1]), Integer.parseInt(args[2]), Arrays.asList(args).subList(3, args.length));
     else if (args.length >= 2 && args[0].equals("inv")) {
       // parent side of the INV scenario: run it in a child JVM per configuration
       String cmd = System.getenv("HUNTER_JAVA_CMD");
@@ -1728,6 +2013,15 @@ final class HunterH4 {
     lastSelfWait.clear();
   }
 
+  /** Drop contexts of threads that have ended (soak: client threads churn). */
+  static void purge() {
+    byTid.values().removeIf(sc -> {
+      OGScheduler.Context c = ctxOf(sc);
+      return c == null || c.thread == null || !c.thread.isAlive();
+    });
+    lastSelfWait.keySet().removeIf(sc -> !byTid.containsValue(sc));
+  }
+
   static OGScheduler.Context ctxOf(OGSchedulerContext sc) {
     return (OGScheduler.Context) CTX.get(sc);
   }
@@ -1811,7 +2105,7 @@ final class HunterH4 {
       // unstamped node run inside an unrelated sync frame is the other way into the R9 end state (seed 14).
       inc("unstamped." + path);
       Stamp u = new Stamp(0, 0, null);
-      u.takePath = path;
+      u.takePath = keepPath(STAMP.get(t), path, tid);
       u.takeTid = tid;
       u.takeC = c;
       u.takeFrame = epochs(sc)[c];
@@ -1834,7 +2128,7 @@ final class HunterH4 {
       return;
     }
     long[] cur = epochs(sc);
-    s.takePath = path;
+    s.takePath = keepPath(s, path, tid);
     s.takeTid = tid;
     s.takeC = c;
     s.takeFrame = cur[c];
@@ -1852,6 +2146,13 @@ final class HunterH4 {
       if (r9) inc("r9AtTake." + path);
       report(r9 ? "STALE_TAKE+R9_SHAPE" : "STALE_TAKE", t, sc, tid, c, s, path);
     }
+  }
+
+  /** The run check follows the hand-out check of the same take: keep the hand-out path ("wakeup+run"). */
+  static String keepPath(Object old, String path, int tid) {
+    if (path.equals("run") && old instanceof Stamp o && o.takePath != null && o.takeTid == tid && !o.takePath.startsWith("run") && o.takePath.indexOf('(') < 0
+        && o.takePath.indexOf('+') < 0) return o.takePath + "+run";
+    return path;
   }
 
   /** t is the node the top sync frame awaits, or on its waitingOn chain (drainQueue / findWorkOnForwardChain run these directly). */
@@ -1883,33 +2184,122 @@ final class HunterH4 {
     if (printed.incrementAndGet() <= 20) System.out.println(l);
   }
 
+  /**
+   * Dependencies of a node that is not done: its waitingOn, and for hunter nodes that have started
+   * (so cannot be cancelled-instead-of-run any more) every kid that is not done. Every hunter kind
+   * completes only after all its kids, so these are hard dependencies even where continueWith
+   * leaves no waitingOn edge (FAN/MIXED/ASYNC count-downs).
+   */
+  static void deps(NodeTask n, java.util.function.Consumer<NodeTask> out) {
+    NodeTask w = n.getWaitingOn();
+    if (w != null && !w.isDoneEx()) out.accept(w);
+    if (n instanceof Hunter.HN h && h.runs.get() > 0)
+      for (int j = 0; j < h.nk(); j++) {
+        Hunter.HN k = h.kid(j);
+        if (!k.isDoneEx()) out.accept(k);
+      }
+  }
+
+  /** BFS from start over deps; returns the path to the first node accepted by hit, or null. */
+  static List<NodeTask> reach(NodeTask start, java.util.function.Predicate<NodeTask> hit) {
+    if (start == null || start.isDoneEx()) return null;
+    java.util.IdentityHashMap<NodeTask, NodeTask> parent = new java.util.IdentityHashMap<>();
+    java.util.ArrayDeque<NodeTask> q = new java.util.ArrayDeque<>();
+    parent.put(start, start);
+    q.add(start);
+    while (!q.isEmpty() && parent.size() < 20000) {
+      NodeTask x = q.poll();
+      if (hit.test(x)) {
+        List<NodeTask> path = new ArrayList<>();
+        for (NodeTask y = x; ; y = parent.get(y)) {
+          path.add(0, y);
+          if (y == start) break;
+        }
+        return path;
+      }
+      if (x != start && (x instanceof Hunter.HN h) && h.runs.get() == 0) continue; // not started: could still be cancelled instead of run
+      deps(x, y -> {
+        if (!parent.containsKey(y)) {
+          parent.put(y, x);
+          q.add(y);
+        }
+      });
+    }
+    return null;
+  }
+
+  static String path(List<NodeTask> p) {
+    StringBuilder sb = new StringBuilder();
+    for (NodeTask n : p) sb.append(sb.length() == 0 ? "" : " -> ").append(n);
+    return sb.toString();
+  }
+
   /** runAndWait before _scheduler.wait (owner thread), and the fullWait deadlock-timer tick. */
   public static void beforeWait(OGSchedulerContext sc, NodeTask awaited, String where) {
     if (!ok || sc == null || awaited == null) return;
     inc("waits." + where);
     var stack = sc.dbgHashOfSyncStack();
-    NodeTask x = awaited;
-    for (int d = 0; x != null && d < 64 && !x.isDoneEx(); d++, x = x.getWaitingOn()) {
+    List<NodeTask> p = reach(awaited, stack::containsKey);
+    if (p != null) {
+      if (lastSelfWait.put(sc, awaited) == awaited) return; // already reported for this wait
+      NodeTask x = p.get(p.size() - 1);
       Integer at = stack.get(x);
-      if (at != null) {
-        if (lastSelfWait.put(sc, awaited) == awaited) return; // already reported for this wait
-        inc("selfWait." + where);
-        String l = "H4 SELF_WAIT where=" + where + " thread=" + Thread.currentThread().getName() + " awaits=" + awaited + " chainDepth=" + d
-            + " reaches " + x + " suspended in sync frame " + at + " of " + stack.size() + " on this thread; causality=" + CUR.get(sc);
+      inc("selfWait." + where);
+      String l = "H4 SELF_WAIT where=" + where + " thread=" + Thread.currentThread().getName() + " awaits=" + awaited + " path=" + path(p)
+          + " reaches " + x + " suspended in sync frame " + at + " of " + stack.size() + " on this thread; causality=" + CUR.get(sc);
+      if (firstSelfWait == null) firstSelfWait = l;
+      System.out.println(l);
+      // how the frames above the reached one got onto this thread (stamp and last take of each frame's node)
+      long[] ep = epochs(sc);
+      StringBuilder fr = new StringBuilder("H4 SELF_WAIT frames (index: node, causality-level epochs " + java.util.Arrays.toString(java.util.Arrays.copyOf(ep, (int) Math.min(ep.length, ep[0] + 1))) + "):");
+      for (var e : new java.util.TreeMap<Integer, NodeTask>(invert(stack)).entrySet()) fr.append("\n   ").append(e.getKey()).append(": ").append(stampInfo(e.getValue()));
+      fr.append("\n   awaited path:");
+      for (NodeTask y : p) fr.append(" -> ").append(stampInfo(y));
+      System.out.println(fr);
+      Hunter.finding("CAUSALITY_SELF_WAIT", l.substring(3));
+      return;
+    }
+    if (where.equals("timer")) {
+      String cyc = waitCycle(sc, awaited);
+      if (cyc != null && lastSelfWait.put(sc, awaited) != awaited) {
+        inc("waitCycle.timer");
+        String l = "H4 WAIT_CYCLE thread=" + Thread.currentThread().getName() + " " + cyc;
         if (firstSelfWait == null) firstSelfWait = l;
         System.out.println(l);
-        // how the frames above the reached one got onto this thread (stamp and last take of each frame's node)
-        long[] ep = epochs(sc);
-        StringBuilder fr = new StringBuilder("H4 SELF_WAIT frames (index: node, causality-level epochs " + java.util.Arrays.toString(java.util.Arrays.copyOf(ep, (int) Math.min(ep.length, ep[0] + 1))) + "):");
-        for (var e : new java.util.TreeMap<Integer, NodeTask>(invert(stack)).entrySet()) fr.append("\n   ").append(e.getKey()).append(": ").append(stampInfo(e.getValue()));
-        fr.append("\n   awaited chain:");
-        NodeTask y = awaited;
-        for (int k = 0; y != null && k <= d; k++, y = y.getWaitingOn()) fr.append(" -> ").append(stampInfo(y));
-        System.out.println(fr);
-        Hunter.finding("CAUSALITY_SELF_WAIT", l.substring(3));
-        return;
+        Hunter.finding("CAUSALITY_WAIT_CYCLE", l.substring(3));
       }
     }
+  }
+
+  /**
+   * Cross-thread form: thread T awaits a; a depends on X suspended on thread U's sync stack; U
+   * awaits b; ... back to T. Every thread on the cycle is blocked for good (no graph cycle: the
+   * cycle goes through "suspended below on the same stack" edges that canTake was meant to prevent).
+   */
+  static String waitCycle(OGSchedulerContext me, NodeTask myAwaited) {
+    java.util.IdentityHashMap<NodeTask, OGSchedulerContext> onStack = new java.util.IdentityHashMap<>();
+    for (OGSchedulerContext c : byTid.values())
+      for (var e : c.dbgHashOfSyncStack().entrySet()) if (e.getValue() > 0 && e.getKey() != null) onStack.putIfAbsent(e.getKey(), c);
+    StringBuilder sb = new StringBuilder();
+    java.util.Set<OGSchedulerContext> seen = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+    OGSchedulerContext c = me;
+    NodeTask a = myAwaited;
+    for (int hops = 0; hops < 16; hops++) {
+      seen.add(c);
+      final OGSchedulerContext cc = c;
+      List<NodeTask> p = reach(a, n -> onStack.containsKey(n) && (onStack.get(n) != cc || cc == me));
+      if (p == null) return null;
+      NodeTask x = p.get(p.size() - 1);
+      OGSchedulerContext u = onStack.get(x);
+      OGScheduler.Context uc = ctxOf(u);
+      sb.append(" [tid ").append(ctxOf(c).threadID).append(" awaits ").append(path(p)).append(" suspended on tid ").append(uc.threadID).append(']');
+      if (u == me) return "cycle" + sb;
+      if (seen.contains(u)) return null; // a cycle that does not include me; its members report it
+      if (uc.awaitedTask == null || uc.awaitedCausalityID == 0 && !onStack.containsValue(u)) return null;
+      c = u;
+      a = uc.awaitedTask;
+    }
+    return null;
   }
 
   static java.util.Map<Integer, NodeTask> invert(java.util.Map<NodeTask, Integer> m) {
@@ -1918,14 +2308,14 @@ final class HunterH4 {
     return r;
   }
 
-  /** Post-mortem for the watchdog: same check for a parked waiter, from another thread. */
+  /** Post-mortem for the watchdog: same checks for a parked waiter, from another thread. */
   static String postMortem(OGScheduler.Context c) {
     if (!ok || c.schedulerContext == null || c.awaitedTask == null) return "";
     var stack = c.schedulerContext.dbgHashOfSyncStack();
-    NodeTask x = c.awaitedTask;
-    for (int d = 0; x != null && d < 64 && !x.isDoneEx(); d++, x = x.getWaitingOn())
-      if (stack.containsKey(x)) return " selfWait(" + x + "@frame" + stack.get(x) + ")";
-    return "";
+    List<NodeTask> p = reach(c.awaitedTask, stack::containsKey);
+    if (p != null) return " selfWait(" + path(p) + "@frame" + stack.get(p.get(p.size() - 1)) + ")";
+    String cyc = waitCycle(c.schedulerContext, c.awaitedTask);
+    return cyc == null ? "" : " waitCycle(" + cyc + ")";
   }
 
   static String summary() {
@@ -1936,7 +2326,7 @@ final class HunterH4 {
           .append(" h4unstamped.").append(p).append('=').append(get("unstamped." + p))
           .append(" h4r9AtTake.").append(p).append('=').append(get("r9AtTake." + p)).append(" h4unknown.").append(p).append('=').append(get("unknownStamp." + p))
           .append(" h4aliased.").append(p).append('=').append(get("aliased." + p)).append(" h4direct.").append(p).append('=').append(get("direct." + p));
-    sb.append(" h4selfWait.wait=").append(get("selfWait.wait")).append(" h4selfWait.timer=").append(get("selfWait.timer"))
+    sb.append(" h4selfWait.wait=").append(get("selfWait.wait")).append(" h4selfWait.timer=").append(get("selfWait.timer")).append(" h4waitCycle.timer=").append(get("waitCycle.timer"))
         .append(" h4waits=").append(get("waits.wait")).append(" h4runs=").append(get("runs")).append(" h4stampAboveDepth=").append(get("stampAboveDepth"))
         .append(" h4on=").append(ok);
     return sb.toString().trim();

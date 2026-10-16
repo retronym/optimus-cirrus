@@ -55,6 +55,34 @@ protected final void complete(EvaluationQueue eq, int doneState) {
 }
 ```
 
+The run-state bits as a state machine (flag bits above bit 5 are orthogonal and not shown):
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    NEW: NEW (0)
+    RUNNABLE: RUNNABLE<br/>STARTED
+    RUNNING: RUNNING<br/>STARTED | NOT_RUNNABLE
+    DONE: DONE<br/>DONE_FLAG | NOT_RUNNABLE (| FAILED)
+    INVALID: INVALIDATED<br/>INVALID_CACHE | NOT_RUNNABLE<br/>(DONE_FLAG cleared)
+    HALF: DONE_FLAG only<br/>isDone() false, isRunnable() true
+
+    [*] --> NEW
+    NEW --> RUNNING: tryRun() wins the CAS
+    RUNNABLE --> RUNNING: tryRun() wins the CAS
+    RUNNING --> RUNNABLE: onChildCompleted → markAsRunnable (suspended, child done)
+    RUNNING --> DONE: complete() / completeWithException()
+    DONE --> INVALID: invalidateCache() (cache/tracker, no notify)
+    INVALID --> DONE: complete() (waiters still registered)
+    DONE --> HALF: markAsRunnable() racing complete() (R8)
+    HALF --> RUNNING: tryRun() wins again → run() twice → logAndDie
+    DONE --> [*]
+    note right of DONE
+        "done" needs two bits.
+        isDoneEx() also accepts INVALID.
+    end note
+```
+
 **Parallels.** `java.util.concurrent.FutureTask` (state word with CAS transitions), `CompletableFuture` (result plus a lock-free completion-callback stack), Rust's `Future` plus a `Waker`. The closest is Kotlin coroutines' `DispatchedTask`/`JobSupport`: state machine, children, cancellation all in one object.
 
 **Where it differs.** `FutureTask` has four states and one transition path. `NodeTask` has 23 flag bits and many writers: the scheduler (`tryRun`, `markAsRunnable`), the cache (`invalidateCache` clears `DONE_FLAG`), plugins (`markAsAdapted`), the dependency tracker, graph walkers (`VISITED_*`). The one rule that matters: `run()` is guarded by the CAS in `tryRun` that sets `NOT_RUNNABLE`; everything downstream assumes a task that fails that CAS was not run twice. "Done" is `DONE_FLAG | NOT_RUNNABLE`, two bits, so a writer that clears one can produce a state the predicates disagree about.
@@ -99,6 +127,25 @@ public final void continueWith(NodeAwaiter waiter, EvaluationQueue eq) {
   markAsRunnable();
   eq.enqueue(null, this);                      // the completer's queue, i.e. some other thread's deque
 }
+```
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    null: null<br/>(no waiters)
+    single: NodeAwaiter<br/>(one waiter)
+    list: NWList<br/>(persistent cons list, LIFO)
+    completed: completed<br/>(sealed sentinel)
+
+    [*] --> null
+    null --> single: tryAddToWaiterList CAS
+    single --> list: tryAddToWaiterList CAS<br/>(wrap + cons)
+    list --> list: tryAddToWaiterList CAS<br/>continueWithLast: rebuild O(n)
+    null --> completed: notifyWaiters swap
+    single --> completed: notifyWaiters swap,<br/>then call the one waiter
+    list --> completed: notifyWaiters swap,<br/>then walk and call each
+    completed --> completed: tryAddToWaiterList returns false<br/>→ caller invokes callback itself
+    completed --> null: reset() (clone / re-run; not thread safe)
 ```
 
 **Parallels.** `CompletableFuture`'s Treiber stack of `Completion` nodes with the `null`/stack/done states; `AbstractQueuedSynchronizer`'s CLH queue; JavaScript promise reaction lists. The exactly-once-via-CAS contract is the same one as in `CompletableFuture.uniPush`.
@@ -215,6 +262,35 @@ public final boolean tryRemove(T item) {
 public final void foreach(Consumer<T> c) { for (T x : q) { if (x == null) break; c.accept(x); } }   // no lock of its own
 ```
 
+A `Context` (one per graph thread) moves between the four sets under `_lock`:
+
+```mermaid
+stateDiagram-v2
+    outside: not in graph<br/>(user thread before first get)
+    workers: _workers<br/>running / draining / spinning
+    waiters: _waiters<br/>parked in fullWait on awaitedTask
+    idle: _idlePool<br/>parkNanos(1s) loop, helper only
+    blocked: _externallyBlocked<br/>doBlockingAction (holding a non-graph lock)
+    dead: thread gone
+
+    [*] --> outside
+    outside --> workers: enterGraph (first runAndWait on this thread)
+    workers --> outside: exitGraph (sync stack empty again)
+    workers --> waiters: nextStepForWorkingThread: no work, awaitTask != null<br/>parked = true
+    waiters --> workers: tryWakeupThread (enqueue handed me a task,<br/>or my awaited node completed) parked = false, unpark
+    waiters --> workers: deadlock timer found runnable work on my chain
+    workers --> idle: nextStepForWorkingThread: no work, helper,<br/>idle.count < 2×ideal
+    idle --> workers: injectThread (addWorkerIfNeeded / evaluateOnGraphThread…)<br/>becomes the spinner
+    workers --> dead: nextStepForWorkingThread: idle pool full, or shutdown<br/>ctx.shutdown = true
+    workers --> blocked: doBlockingAction → exitGraph(externallyBlocked)
+    blocked --> workers: enterGraph(wasExternallyBlocked)
+    workers --> dead: panic() (thread dies, Context NOT removed: F2b)
+    note right of waiters
+        Under limitThreads, waiters count
+        against the ideal in addWorkerIfNeeded.
+    end note
+```
+
 **Parallels.** ForkJoinPool's `ctl` word and "signalWork" ramp-up (one activator at a time), Go's `spinning M` (at most GOMAXPROCS/2 spinning, the rest parked), Tokio's single "searching" worker gate, .NET's hill-climbing thread injection. The idle pool with `parkNanos(1 s)` is the classic "keep a few warm threads" trick.
 
 **Where it differs.** FJP and Go are lock-free on the hot path; here `enqueue` from outside, every wake-up, thread injection, stall handling, cycle detection and the stalled callbacks all run under one `synchronized (_lock)` (23 sites). The spinner uses `Thread.yield()` in a loop rather than `onSpinWait` plus timed park. Waiting threads are first-class citizens of the pool: a thread blocked in a sync wait is still "in the graph", helps by stealing, and counts toward the ideal.
@@ -226,6 +302,52 @@ public final void foreach(Consumer<T> c) { for (T x : q) { if (x == null) break;
 Optimus code can call `node.get` from inside a running node. That blocks the thread in `runAndWait`, which pushes a `SyncFrame`, registers the frame as a waiter on the awaited node, and then *helps*: it drains its own queue and steals from others until the awaited node is done. The frames on a thread form its *sync stack*. This is "blocking by helping", as in FJP's `helpJoin`/`awaitJoin` and `CompletableFuture.join` on a pool thread, but with an extra problem: if the thread helps by running a task that itself (transitively) needs a node that is suspended lower on this very stack, it deadlocks itself.
 
 The defence is *causality*. Each sync frame that could matter bumps `currentCausalityID` (a depth) on the context; every task the thread runs is stamped `(threadID, depth)` into `NodeTask._causality` (two 16-bit halves of one int). `canTake(task, threadID, depth)` lets a thread at depth `d` take only tasks stamped with its own id at depth ≥ `d`, or tasks with no stamp at all; the forward-chain walk in `wait()` re-stamps the chain so the awaited work is always takeable; `poisonCausality` marks work that nobody with a sync stack may touch. The whole thing is a cheap, conservative approximation of "would running this put me below myself?"
+
+A sync `get` whose child is finished by another thread, end to end:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant T as Thread T<br/>(OGSchedulerContext)
+    participant S as OGScheduler<br/>(_lock)
+    participant N as Node N<br/>(_waiters)
+    participant W as Thread W<br/>(completer)
+
+    T->>T: runAndWait(N): push SyncFrame, prevNode.waitingOn = N,<br/>causality += 1, marker = localQ.top
+    T->>N: tryAddToWaiterList(frame)  (CAS)
+    T->>T: drainQueue(N, marker): tryRun(N) … N suspends on a child
+    loop until N.isDoneEx()
+        T->>S: wait(N, ctx, causality)
+        S->>S: spin / steal / scanToFindWork (canTake-checked)
+        S->>S: findWorkOnForwardChain(N): re-stamp chain, run its tail if runnable
+        S->>S: nextStepForWorkingThread: _workers → _waiters, parked = true
+        T->>T: fullWait: park() (1 s timer: chain walk, stalled-callback recovery)
+    end
+    W->>N: complete(): tryUpdateState(DONE) then notifyWaiters()
+    N->>T: frame.onChildCompleted(eqW, N)   (synchronous, on W)
+    T->>S: awakeOnComplete(N, ctxT)   [SyncFrame → scheduler]
+    S->>S: ctx.awaitedTask == N ? tryWakeupThread: _waiters → _workers,<br/>parked = false, unpark(T.thread)
+    T->>T: fullWait returns ctx.awaitedTask; loop sees N.isDoneEx()
+    T->>T: finally: restore causality/marker, waitingOn = null, pop frame,<br/>exitGraph if the stack is empty
+```
+
+Hand-off of global work to a parked waiter, the path that R9 abuses:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant X as non-graph thread<br/>(promise completes P)
+    participant S as OGScheduler.enqueue<br/>(_lock)
+    participant T as Thread T<br/>parked at depth d on S'
+    X->>X: P.complete(scheduler): notifyWaiters → Z.onChildCompleted
+    X->>S: enqueue(Z)   (Z stamped (T, d₀) by a frame that has since popped)
+    S->>S: for each waiter ctx: canTake(Z, ctx.threadID, ctx.awaitedCausalityID)?
+    Note over S: depth d ≤ d₀ and same thread id → true
+    S->>T: wakeupThread: ctx.awaitedTask = Z, parked = false, unpark
+    T->>T: fullWait returns Z; drainQueue(Z) runs Z inside the frame waiting on S'
+    T->>T: Z's continuation: runAndWait(S') … S' is suspended lower on T's own stack
+    Note over T: parks on S'. No waitingOn cycle, nothing runnable: permanent.
+```
 
 ```java
 // OGSchedulerContext.runAndWait, distilled: block-by-helping with a sync frame.
@@ -277,6 +399,25 @@ for (NodeTask t = awaitTask.getWaitingOn(); t != null && t != fast; t = t.getWai
 ## 6. Stalls, batching and the out-of-work listeners
 
 When the last working thread cannot find anything to run, the graph has *stalled*. That is a feature, not a failure: plugins such as the DAL batcher register `OutOfWorkListener`s and use the stall as the moment to fire a batch of deferred requests, so the engine is a natural batching system in the style of Haxl or Facebook's `DataLoader`. Listeners have priorities and are called in passes; a pass stops when a callback added work. `mustCallDelay`/`mustWaitDelay` add timers via `ScheduledNodeTask`.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as client thread<br/>(sync get on R)
+    participant S as OGScheduler<br/>(_lock held throughout)
+    participant B as DAL batcher<br/>(OutOfWorkListener)
+    participant IO as remote service
+
+    C->>S: wait(R): findWork(…, desperateSearchUnderLock = true)
+    S->>S: nothing on any queue; isStalling(ctx) → _workers.count == 1
+    S->>B: checkForNewWork(scheduler)   (every listener, for-each over the PriorityQueue)
+    S->>B: onGraphStalled(scheduler, outstanding)   (highest priority first; deregistered when called)
+    B->>IO: send the batch of N deferred node requests
+    B->>S: later, from an IO thread: node.complete(…) / scheduler.enqueue(…)
+    S->>S: newWorkAdded? re-scan _qqueue / _queue; else next priority
+    S->>S: still nothing and _workers.count == 1: detectCycles over waiters and tracked nodes
+    S-->>C: null → fullWait: park; 1 s timer re-checks "callbacks pending and no workers"
+```
 
 ```java
 // OGScheduler.findWork (desperate path, under _lock) and runOnStalledCallbacks, distilled.
