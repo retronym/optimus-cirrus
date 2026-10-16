@@ -884,7 +884,7 @@ public final class Hunter {
         NodeTask at = c.awaitedTask;
         boolean atDone = at != null && at.isDoneEx();
         System.out.println("  waiter " + (c.thread == null ? "?" : c.thread.getName()) + " tid=" + c.threadID + " parked=" + c.parked
-            + " awaitedCausality=" + c.awaitedCausalityID + " awaited=" + at + " awaitedDone=" + atDone
+            + " awaitedCausality=" + c.awaitedCausalityID + " awaited=" + at + " awaitedDone=" + atDone + HunterH4.postMortem(c)
             + (at != null ? " awaitedState=" + at.stateAsString().replace(' ', '_') + " awaitedCausality=" + at.causalityThreadID() + "/" + at.causalityID() : ""));
         if (atDone && c.parked) lost++;
       }
@@ -951,6 +951,7 @@ public final class Hunter {
       t.printStackTrace(System.out);
       cls.append("other:classify-error ");
     }
+    System.out.println("KV h4 " + HunterH4.summary());
     System.out.println((fatal ? "HANG-CLASS " : "STALL-CLASS ") + cls.toString().trim().replace(' ', '+'));
     System.out.flush();
     if (fatal) Runtime.getRuntime().halt(3);
@@ -1088,6 +1089,7 @@ public final class Hunter {
          + " timerLW=" + HunterHooks.timerLW.get() + " timerLWInFlight=" + HunterHooks.timerLWInFlight.get() + " timerCS=" + HunterHooks.timerCS.get() + " timerCalls=" + HunterHooks.timerCalls.get()
         + " maxSettleMs=" + maxSettleMs + " ogLiveBefore=" + liveBefore + " ogLiveAfter=" + liveAfter + " findings=" + findingCount.get());
     System.out.println("KV h5 " + fin + " violations=" + (fin.violations().isEmpty() ? "none" : String.join(",", fin.violations())));
+    System.out.println("KV h4 " + HunterH4.summary());
     System.out.flush();
     int code = 0;
     boolean oracle = false, h5only = false;
@@ -1270,9 +1272,11 @@ public final class Hunter {
           + " " + zz + ".causality=" + zz.causalityThreadID() + "/" + zz.causalityID());
       for (StackTraceElement e : t.getStackTrace()) if (e.getClassName().startsWith("optimus.graph")) System.out.println("    " + e);
       System.out.println(s.toString());
+      System.out.println("KV h4 " + HunterH4.summary());
       System.out.flush();
       Runtime.getRuntime().halt(3);
     }
+    System.out.println("KV h4 " + HunterH4.summary());
     System.out.println("KV inv completed (no hang)");
     System.out.flush();
     Runtime.getRuntime().halt(0);
@@ -1344,7 +1348,8 @@ public final class Hunter {
     for (String l : lines)
       if (l.startsWith("KV ")) for (String t : l.substring(3).split(" ")) {
         int e = t.indexOf('=');
-        if (e > 0) m.putIfAbsent(t.substring(0, e), t.substring(e + 1));
+        if (e > 0 && t.startsWith("h4")) m.put(t.substring(0, e), t.substring(e + 1)); // last snapshot wins
+        else if (e > 0) m.putIfAbsent(t.substring(0, e), t.substring(e + 1));
       }
     return m;
   }
@@ -1390,9 +1395,28 @@ public final class Hunter {
     return new Res(seed, cfg, maxN, exit, cls, det.toString(), wall, log, kv);
   }
 
+  static String h4brief(Map<String, String> k) {
+    if (k.get("h4on") == null) return "h4=[n/a]";
+    long take = 0, stale = 0, same = 0, popped = 0, r9 = 0, unk = 0, alias = 0;
+    StringBuilder per = new StringBuilder();
+    for (String p : new String[] {"wakeup", "findWork", "run"}) {
+      take += Long.parseLong(k.getOrDefault("h4take." + p, "0"));
+      long st = Long.parseLong(k.getOrDefault("h4stale." + p, "0"));
+      stale += st;
+      same += Long.parseLong(k.getOrDefault("h4sameDepth." + p, "0"));
+      popped += Long.parseLong(k.getOrDefault("h4popped." + p, "0"));
+      r9 += Long.parseLong(k.getOrDefault("h4r9AtTake." + p, "0"));
+      unk += Long.parseLong(k.getOrDefault("h4unknown." + p, "0"));
+      alias += Long.parseLong(k.getOrDefault("h4aliased." + p, "0"));
+      per.append(p).append(':').append(st).append('/').append(k.getOrDefault("h4take." + p, "0")).append(',');
+    }
+    return "h4=[staleTake=" + stale + " sameDepth=" + same + " popped=" + popped + " r9AtTake=" + r9 + " selfWait=" + k.get("h4selfWait.wait") + "+" + k.get("h4selfWait.timer")
+        + " aliased=" + alias + " unknown=" + unk + " stale/take=" + per.substring(0, per.length() - 1) + "]";
+  }
+
   static String resultLine(Res r) {
     Map<String, String> k = r.kv;
-    return String.format("RESULT seed=%d cfg=%s N=%s class=%s exit=%d wallMs=%d iters=%s maxIterMs=%s medIterMs=%s timerLW=%s timerCS=%s cancelledNodes=%s promises=%s extLaunches=%s h5=[%s]%s spec=[%s] log=%s",
+    return String.format("RESULT seed=%d cfg=%s N=%s class=%s exit=%d wallMs=%d iters=%s maxIterMs=%s medIterMs=%s timerLW=%s timerCS=%s cancelledNodes=%s promises=%s extLaunches=%s h5=[%s] " + h4brief(k).replace("%", "%%") + "%s spec=[%s] log=%s",
         r.seed, r.cfg, k.getOrDefault("N", "?"), r.cls, r.exit, r.wallMs, k.get("iters"), k.get("maxIterMs"), k.get("medIterMs"),
         k.get("timerLW"), k.get("timerCS"), k.get("cancelledNodes"), k.get("promises"), k.get("extLaunches"),
         "workers=" + k.get("workers") + ",waiters=" + k.get("waiters") + ",idle=" + k.get("idle") + ",spin=" + k.get("spin") + ",qq=" + k.get("qqRun/Tot")
@@ -1554,7 +1578,7 @@ public final class Hunter {
         String hang = lines.stream().filter(l -> l.startsWith("INV-HANG")).findFirst().orElse("");
         boolean invalid = lines.stream().anyMatch(l -> l.contains("GraphInInvalidState"));
         System.out.println("RESULT scenario=" + (n2 ? "N2" : "INV") + " cfg=" + cfg + " class=" + (!fin ? "HANG:unresponsive" : p.exitValue() == 3 ? (n2 ? "HANG:causality-stall(N2)" : "HANG:sync-stack-inversion(N3)") : p.exitValue() == 0 ? "PASS" : "CRASH(" + p.exitValue() + ")")
-            + (invalid ? "+ASSERT" : "") + " " + hang + " log=" + log.getFileName());
+            + (invalid ? "+ASSERT" : "") + " " + hang + " " + h4brief(kvs(lines)) + " log=" + log.getFileName());
       }
     } else if (args.length >= 2 && args[0].equals("spec")) {
       for (int i = 1; i < args.length; i++) System.out.println("seed " + args[i] + ": " + generate(Long.parseLong(args[i]), 0).summary());
@@ -1590,6 +1614,7 @@ final class HunterHooks {
   /** fullWait's deadlock-timer branch: what findWorkOnForwardChain(awaitTask) found after >= 1 s parked. */
   public static void timerFound(NodeTask found, NodeTask awaitTask) {
     timerCalls.incrementAndGet();
+    HunterH4.beforeWait(OGSchedulerContext.current(), awaitTask, "timer");
     if (found == null) return;
     if (found == awaitTask && awaitTask.isDoneEx()) {
       // Distinguish a lost wakeup from one in flight: if nobody has cleared ctx.parked 20 ms later
@@ -1622,6 +1647,303 @@ final class HunterHooks {
 }
 
 /**
+ * H4 causality oracle, fed by {@link HunterAgent} hooks. canTake claims: a thread at causality c may
+ * take a task stamped (T, d) iff T is itself and d >= c, "because it's caused by work we're
+ * currently processing". The stamp is a depth, not a frame identity. This oracle keeps the identity:
+ *
+ * <ul>
+ *   <li>Every OGSchedulerContext gets an epoch vector (agent-added field hunterEpochs): ep[k] is a
+ *       globally unique id of the frame that raised currentCausalityID to k (ep[0] = last seen c).
+ *   <li>Every NodeTask.setCausality(c, tid) records (tid, c, ep[1..c] of thread tid) in the
+ *       agent-added field NodeTask.hunterStamp.
+ *   <li>Take events (wakeup = tryWakeupThread handing a task to a waiter; findWork = findWork's
+ *       return under causality > 0; run = OGSchedulerContext.run before it re-stamps, under
+ *       causality > 0, which covers local-queue pops too) check that the frame at the taker's level
+ *       c is the frame that was at level c when the task was stamped. If not, canTake accepted a
+ *       stale stamp (STALE_TAKE; sameDepth when d == c, which is the R9 shape). popped counts stamps
+ *       whose depth exceeds the stamping thread's current depth (the stamping frame has popped; the
+ *       take is still sound if the frame at level c is unchanged).
+ *   <li>SELF_WAIT: before runAndWait parks (and on each deadlock-timer tick) the awaited node's
+ *       forward chain (waitingOn) is walked; reaching a node that is suspended on this thread's own
+ *       sync stack is a certain deadlock (R9's end state), reported before the watchdog fires.
+ * </ul>
+ */
+final class HunterH4 {
+  static final boolean ON = !"false".equals(System.getProperty("hunter.h4"));
+  static final java.lang.invoke.VarHandle STAMP, EPOCHS, CUR, CTX;
+  static final AtomicLong SEQ = new AtomicLong();
+  static final java.util.concurrent.ConcurrentHashMap<Integer, OGSchedulerContext> byTid = new java.util.concurrent.ConcurrentHashMap<>();
+  static final java.util.concurrent.ConcurrentHashMap<String, AtomicLong> counts = new java.util.concurrent.ConcurrentHashMap<>();
+  static final java.util.concurrent.ConcurrentHashMap<OGSchedulerContext, NodeTask> lastSelfWait = new java.util.concurrent.ConcurrentHashMap<>();
+  static final AtomicInteger printed = new AtomicInteger();
+  static volatile String firstStale, firstSelfWait;
+  static final boolean ok;
+
+  static final class Stamp {
+    final int tid, c;
+    final long[] ep;
+    // last take checked against this stamp: path, taker tid@causality, taker frame at that level, verdict
+    volatile String takePath, verdict;
+    volatile int takeTid, takeC;
+    volatile long takeFrame;
+    Stamp(int tid, int c, long[] ep) {
+      this.tid = tid;
+      this.c = c;
+      this.ep = ep;
+    }
+  }
+
+  static {
+    java.lang.invoke.VarHandle a = null, b = null, c = null, d = null;
+    boolean k = false;
+    try {
+      var l = java.lang.invoke.MethodHandles.lookup();
+      a = java.lang.invoke.MethodHandles.privateLookupIn(NodeTask.class, l).findVarHandle(NodeTask.class, "hunterStamp", Object.class);
+      var lc = java.lang.invoke.MethodHandles.privateLookupIn(OGSchedulerContext.class, l);
+      b = lc.findVarHandle(OGSchedulerContext.class, "hunterEpochs", long[].class);
+      c = lc.findVarHandle(OGSchedulerContext.class, "currentCausalityID", int.class);
+      d = lc.findVarHandle(OGSchedulerContext.class, "_context", OGScheduler.Context.class);
+      k = true;
+    } catch (Throwable t) {
+      System.out.println("HunterH4: disabled, agent fields missing: " + t);
+    }
+    STAMP = a;
+    EPOCHS = b;
+    CUR = c;
+    CTX = d;
+    ok = k && ON;
+  }
+
+  static void inc(String k) {
+    counts.computeIfAbsent(k, x -> new AtomicLong()).incrementAndGet();
+  }
+
+  static long get(String k) {
+    AtomicLong v = counts.get(k);
+    return v == null ? 0 : v.get();
+  }
+
+  static void reset() {
+    counts.clear();
+    lastSelfWait.clear();
+  }
+
+  static OGScheduler.Context ctxOf(OGSchedulerContext sc) {
+    return (OGScheduler.Context) CTX.get(sc);
+  }
+
+  static long[] epochs(OGSchedulerContext sc) {
+    long[] ep = (long[]) EPOCHS.get(sc);
+    if (ep == null) {
+      ep = new long[64];
+      EPOCHS.set(sc, ep);
+      byTid.put(ctxOf(sc).threadID, sc);
+    }
+    return ep;
+  }
+
+  /** After every write of OGSchedulerContext.currentCausalityID (owner thread). */
+  public static void causality(OGSchedulerContext sc) {
+    if (!ok) return;
+    int c = (int) CUR.get(sc);
+    long[] ep = epochs(sc);
+    if (c >= ep.length) {
+      ep = java.util.Arrays.copyOf(ep, Math.max(c + 1, ep.length * 2));
+      EPOCHS.set(sc, ep);
+    }
+    if (c > ep[0]) for (int k = (int) ep[0] + 1; k <= c; k++) ep[k] = SEQ.incrementAndGet();
+    ep[0] = c;
+  }
+
+  /** NodeTask.setCausality entry. */
+  public static void stamp(NodeTask t, int c, int tid) {
+    if (!ok) return;
+    if (c == 0 || tid == 0 || tid == Integer.MAX_VALUE) {
+      STAMP.set(t, null);
+      return;
+    }
+    OGSchedulerContext sc = byTid.get(tid);
+    if (sc == null) {
+      STAMP.set(t, new Stamp(tid, c, null));
+      return;
+    }
+    long[] ep = epochs(sc);
+    if (ep[0] < c) inc("stampAboveDepth"); // stamped with a causality the thread is not at (chain upgrade by another thread?)
+    Stamp ns = new Stamp(tid, c, java.util.Arrays.copyOf(ep, Math.min(ep.length, c + 1)));
+    if (STAMP.get(t) instanceof Stamp old && old.takePath != null && old.takePath.indexOf('(') < 0) { // keep how this node got here (the take that preceded this run)
+      ns.takePath = old.takePath + "(prev stamp " + old.tid + "/" + old.c + " frame=" + (old.ep != null && old.ep.length > old.c ? old.ep[old.c] : -1) + ")";
+      ns.takeTid = old.takeTid;
+      ns.takeC = old.takeC;
+      ns.takeFrame = old.takeFrame;
+      ns.verdict = old.verdict;
+    }
+    STAMP.set(t, ns);
+  }
+
+  /** tryWakeupThread, after awaitedTask is set (hand-out succeeded). */
+  public static void wakeup(NodeTask t, OGScheduler.Context ctx) {
+    if (!ok || ctx == null || t == null) return;
+    if (t.isDoneEx()) return; // awakeOnComplete / deadlock timer handing back the awaited node
+    check(t, ctx.schedulerContext, ctx.threadID, ctx.awaitedCausalityID, "wakeup");
+  }
+
+  /** findWork's return value. */
+  public static void found(NodeTask t, OGScheduler.Context ctx, NodeTask awaitTask) {
+    if (!ok || ctx == null || t == null || t == awaitTask || t.isDoneEx()) return;
+    check(t, ctx.schedulerContext, ctx.threadID, ctx.awaitedCausalityID, "findWork");
+  }
+
+  /** OGSchedulerContext.run after tryRun succeeded, before setCausality re-stamps. */
+  public static void beforeRun(OGSchedulerContext sc, NodeTask t) {
+    if (!ok) return;
+    int c = (int) CUR.get(sc);
+    inc("runs");
+    if (c == 0) return;
+    check(t, sc, ctxOf(sc).threadID, c, "run");
+  }
+
+  static void check(NodeTask t, OGSchedulerContext sc, int tid, int c, String path) {
+    if (c == 0 || sc == null) return;
+    inc("take." + path);
+    int ttid = t.causalityThreadID(), tc = t.causalityID();
+    if (ttid == 0 && tc == 0) {
+      // canTake: "task is compatible with every scheduler if it has no causality information". Record the take: an
+      // unstamped node run inside an unrelated sync frame is the other way into the R9 end state (seed 14).
+      inc("unstamped." + path);
+      Stamp u = new Stamp(0, 0, null);
+      u.takePath = path;
+      u.takeTid = tid;
+      u.takeC = c;
+      u.takeFrame = epochs(sc)[c];
+      u.verdict = "UNSTAMPED";
+      STAMP.set(t, u);
+      return;
+    }
+    Object o = STAMP.get(t);
+    if (!(o instanceof Stamp s) || s.c != tc || (s.tid & 0xFFFF) != (ttid & 0xFFFF) || s.ep == null) {
+      inc("unknownStamp." + path);
+      return;
+    }
+    if (path.equals("run") && onAwaitedChain(t, sc)) {
+      inc("direct." + path); // the frame runs its own awaited node (or its chain): canTake not consulted, legitimate
+      return;
+    }
+    if (s.tid != tid) {
+      inc("aliased." + path); // canTake accepted another thread's stamp (R1 aliasing)
+      report("ALIASED_TAKE", t, sc, tid, c, s, path);
+      return;
+    }
+    long[] cur = epochs(sc);
+    s.takePath = path;
+    s.takeTid = tid;
+    s.takeC = c;
+    s.takeFrame = cur[c];
+    s.verdict = "ok";
+    if (s.c > cur[0]) inc("popped." + path);
+    if (s.ep.length <= c || s.ep[c] != cur[c]) {
+      s.verdict = "STALE";
+      inc("staleTake." + path);
+      if (s.c == c) inc("staleSameDepth." + path);
+      // R9 shape visible at take time: the task, or something on its forward chain, is suspended on the taker's stack
+      var stack = sc.dbgHashOfSyncStack();
+      boolean r9 = false;
+      NodeTask x = t;
+      for (int d = 0; x != null && d < 64; d++, x = x.getWaitingOn()) if (stack.containsKey(x)) r9 = true;
+      if (r9) inc("r9AtTake." + path);
+      report(r9 ? "STALE_TAKE+R9_SHAPE" : "STALE_TAKE", t, sc, tid, c, s, path);
+    }
+  }
+
+  /** t is the node the top sync frame awaits, or on its waitingOn chain (drainQueue / findWorkOnForwardChain run these directly). */
+  static boolean onAwaitedChain(NodeTask t, OGSchedulerContext sc) {
+    var stack = sc.dbgHashOfSyncStack();
+    NodeTask top = null;
+    int best = -1;
+    for (var e : stack.entrySet())
+      if (e.getValue() > best) {
+        best = e.getValue();
+        top = e.getKey();
+      }
+    NodeTask x = top == null ? null : top.getWaitingOn();
+    for (int d = 0; x != null && d < 64; d++, x = x.getWaitingOn()) if (x == t) return true;
+    return false;
+  }
+
+  static String stampInfo(NodeTask n) {
+    Object o = STAMP == null ? null : STAMP.get(n);
+    if (!(o instanceof Stamp s)) return n + "[stamp " + n.causalityThreadID() + "/" + n.causalityID() + " unrecorded]";
+    return n + "[stamp " + s.tid + "/" + s.c + " frame=" + (s.ep != null && s.ep.length > s.c ? s.ep[s.c] : -1) + " lastTake=" + s.takePath + " by " + s.takeTid + "@" + s.takeC
+        + " takerFrame=" + s.takeFrame + " " + s.verdict + "]";
+  }
+
+  static void report(String what, NodeTask t, OGSchedulerContext sc, int tid, int c, Stamp s, String path) {
+    String l = "H4 " + what + " path=" + path + " task=" + t + " stamp=" + s.tid + "/" + s.c + " stampFrame=" + (s.ep.length > c ? s.ep[c] : -1)
+        + " taker=" + tid + "@" + c + " takerFrame=" + epochs(sc)[c] + " takerDepth=" + epochs(sc)[0] + " thread=" + Thread.currentThread().getName();
+    if (firstStale == null) firstStale = l;
+    if (printed.incrementAndGet() <= 20) System.out.println(l);
+  }
+
+  /** runAndWait before _scheduler.wait (owner thread), and the fullWait deadlock-timer tick. */
+  public static void beforeWait(OGSchedulerContext sc, NodeTask awaited, String where) {
+    if (!ok || sc == null || awaited == null) return;
+    inc("waits." + where);
+    var stack = sc.dbgHashOfSyncStack();
+    NodeTask x = awaited;
+    for (int d = 0; x != null && d < 64 && !x.isDoneEx(); d++, x = x.getWaitingOn()) {
+      Integer at = stack.get(x);
+      if (at != null) {
+        if (lastSelfWait.put(sc, awaited) == awaited) return; // already reported for this wait
+        inc("selfWait." + where);
+        String l = "H4 SELF_WAIT where=" + where + " thread=" + Thread.currentThread().getName() + " awaits=" + awaited + " chainDepth=" + d
+            + " reaches " + x + " suspended in sync frame " + at + " of " + stack.size() + " on this thread; causality=" + CUR.get(sc);
+        if (firstSelfWait == null) firstSelfWait = l;
+        System.out.println(l);
+        // how the frames above the reached one got onto this thread (stamp and last take of each frame's node)
+        long[] ep = epochs(sc);
+        StringBuilder fr = new StringBuilder("H4 SELF_WAIT frames (index: node, causality-level epochs " + java.util.Arrays.toString(java.util.Arrays.copyOf(ep, (int) Math.min(ep.length, ep[0] + 1))) + "):");
+        for (var e : new java.util.TreeMap<Integer, NodeTask>(invert(stack)).entrySet()) fr.append("\n   ").append(e.getKey()).append(": ").append(stampInfo(e.getValue()));
+        fr.append("\n   awaited chain:");
+        NodeTask y = awaited;
+        for (int k = 0; y != null && k <= d; k++, y = y.getWaitingOn()) fr.append(" -> ").append(stampInfo(y));
+        System.out.println(fr);
+        Hunter.finding("CAUSALITY_SELF_WAIT", l.substring(3));
+        return;
+      }
+    }
+  }
+
+  static java.util.Map<Integer, NodeTask> invert(java.util.Map<NodeTask, Integer> m) {
+    java.util.Map<Integer, NodeTask> r = new java.util.HashMap<>();
+    for (var e : m.entrySet()) r.put(e.getValue(), e.getKey());
+    return r;
+  }
+
+  /** Post-mortem for the watchdog: same check for a parked waiter, from another thread. */
+  static String postMortem(OGScheduler.Context c) {
+    if (!ok || c.schedulerContext == null || c.awaitedTask == null) return "";
+    var stack = c.schedulerContext.dbgHashOfSyncStack();
+    NodeTask x = c.awaitedTask;
+    for (int d = 0; x != null && d < 64 && !x.isDoneEx(); d++, x = x.getWaitingOn())
+      if (stack.containsKey(x)) return " selfWait(" + x + "@frame" + stack.get(x) + ")";
+    return "";
+  }
+
+  static String summary() {
+    StringBuilder sb = new StringBuilder();
+    for (String p : new String[] {"wakeup", "findWork", "run"})
+      sb.append(" h4take.").append(p).append('=').append(get("take." + p)).append(" h4stale.").append(p).append('=').append(get("staleTake." + p))
+          .append(" h4sameDepth.").append(p).append('=').append(get("staleSameDepth." + p)).append(" h4popped.").append(p).append('=').append(get("popped." + p))
+          .append(" h4unstamped.").append(p).append('=').append(get("unstamped." + p))
+          .append(" h4r9AtTake.").append(p).append('=').append(get("r9AtTake." + p)).append(" h4unknown.").append(p).append('=').append(get("unknownStamp." + p))
+          .append(" h4aliased.").append(p).append('=').append(get("aliased." + p)).append(" h4direct.").append(p).append('=').append(get("direct." + p));
+    sb.append(" h4selfWait.wait=").append(get("selfWait.wait")).append(" h4selfWait.timer=").append(get("selfWait.timer"))
+        .append(" h4waits=").append(get("waits.wait")).append(" h4runs=").append(get("runs")).append(" h4stampAboveDepth=").append(get("stampAboveDepth"))
+        .append(" h4on=").append(ok);
+    return sb.toString().trim();
+  }
+}
+
+/**
  * Second instrumentation agent for the hunter (complements probes.DelayAgent, which only covers
  * WorkQueue). Inserts probes.Delay.point(id) at the lost-wakeup-relevant points of OGScheduler,
  * NodeTask and OGSchedulerContext, plus the fullWait timer-recovery oracle hook:
@@ -1643,6 +1965,7 @@ final class HunterHooks {
 final class HunterAgent {
   static final String HOOK = "probes/Delay";
   static final String HOOKS = "optimus/graph/HunterHooks";
+  static final String H4 = "optimus/graph/HunterH4";
 
   public static void premain(String args, Instrumentation inst) {
     inst.addTransformer(
@@ -1651,6 +1974,7 @@ final class HunterAgent {
           public byte[] transform(ClassLoader loader, String name, Class<?> cls, ProtectionDomain pd, byte[] bytes) {
             if (!"optimus/graph/OGScheduler".equals(name) && !"optimus/graph/NodeTask".equals(name) && !"optimus/graph/OGSchedulerContext".equals(name))
               return null;
+            if (cls != null) return null; // retransform: cannot add the H4 fields again
             try {
               return instrument(name, bytes);
             } catch (Throwable t) {
@@ -1669,9 +1993,43 @@ final class HunterAgent {
     cr.accept(
         new ClassVisitor(Opcodes.ASM9, cw) {
           @Override
+          public void visitEnd() {
+            // H4: side fields for the causality oracle (HunterH4)
+            if (cname.equals("optimus/graph/NodeTask")) super.visitField(Opcodes.ACC_PUBLIC, "hunterStamp", "Ljava/lang/Object;", null, null).visitEnd();
+            if (cname.equals("optimus/graph/OGSchedulerContext")) super.visitField(Opcodes.ACC_PUBLIC, "hunterEpochs", "[J", null, null).visitEnd();
+            super.visitEnd();
+          }
+
+          @Override
           public MethodVisitor visitMethod(int access, String m, String desc, String sig, String[] exc) {
             MethodVisitor mv = super.visitMethod(access, m, desc, sig, exc);
             return new MethodVisitor(Opcodes.ASM9, mv) {
+              void h4(String hname, String hdesc) {
+                super.visitMethodInsn(Opcodes.INVOKESTATIC, H4, hname, hdesc, false);
+                log.append(' ').append(m).append(":h4.").append(hname);
+              }
+
+              @Override
+              public void visitCode() {
+                super.visitCode();
+                if (cname.equals("optimus/graph/NodeTask") && m.equals("setCausality") && desc.equals("(II)V")) {
+                  super.visitVarInsn(Opcodes.ALOAD, 0);
+                  super.visitVarInsn(Opcodes.ILOAD, 1);
+                  super.visitVarInsn(Opcodes.ILOAD, 2);
+                  h4("stamp", "(Loptimus/graph/NodeTask;II)V");
+                }
+              }
+
+              @Override
+              public void visitInsn(int op) {
+                if (op == Opcodes.ARETURN && cname.equals("optimus/graph/OGScheduler") && m.equals("findWork")) {
+                  super.visitInsn(Opcodes.DUP);
+                  super.visitVarInsn(Opcodes.ALOAD, 1);
+                  super.visitVarInsn(Opcodes.ALOAD, 2);
+                  h4("found", "(Loptimus/graph/NodeTask;Loptimus/graph/OGScheduler$Context;Loptimus/graph/NodeTask;)V");
+                }
+                super.visitInsn(op);
+              }
               void hook(String id) {
                 super.visitLdcInsn(id);
                 super.visitMethodInsn(Opcodes.INVOKESTATIC, HOOK, "point", "(Ljava/lang/String;)V", false);
@@ -1685,6 +2043,17 @@ final class HunterAgent {
                   if (owner.equals("optimus/graph/OGScheduler$Context") && name.equals("parked")) hook("s.parked");
                   if (owner.equals("optimus/graph/OGScheduler$Context") && name.equals("awaitedTask")) hook("s.awaited");
                   if (owner.equals("optimus/graph/OGScheduler") && name.equals("_spinningThreadID")) hook("s.spin");
+                }
+                if (cname.equals("optimus/graph/OGScheduler") && op == Opcodes.PUTFIELD && m.equals("tryWakeupThread")
+                    && owner.equals("optimus/graph/OGScheduler$Context") && name.equals("awaitedTask")) {
+                  super.visitVarInsn(Opcodes.ALOAD, 1);
+                  super.visitVarInsn(Opcodes.ALOAD, 2);
+                  h4("wakeup", "(Loptimus/graph/NodeTask;Loptimus/graph/OGScheduler$Context;)V");
+                }
+                if (cname.equals("optimus/graph/OGSchedulerContext") && op == Opcodes.PUTFIELD && !m.equals("<init>")
+                    && owner.equals("optimus/graph/OGSchedulerContext") && name.equals("currentCausalityID")) {
+                  super.visitVarInsn(Opcodes.ALOAD, 0);
+                  h4("causality", "(Loptimus/graph/OGSchedulerContext;)V");
                 }
                 if (cname.equals("optimus/graph/NodeTask") && op == Opcodes.GETFIELD && name.equals("_waiters")
                     && (m.equals("tryAddToWaiterList") || m.equals("tryAddToWaiterListLast") || m.equals("notifyWaiters"))) hook("n.waiters");
@@ -1705,7 +2074,18 @@ final class HunterAgent {
                 if (cname.equals("optimus/graph/NodeTask") && m.equals("notifyWaiters") && name.equals("onChildCompleted")) hook("n.notify");
                 if (cname.equals("optimus/graph/OGSchedulerContext") && m.equals("runAndWait")) {
                   if (name.equals("tryAddToWaiterList")) hook("c.register");
-                  if (name.equals("wait") && owner.equals("optimus/graph/OGScheduler")) hook("c.wait");
+                  if (name.equals("wait") && owner.equals("optimus/graph/OGScheduler")) {
+                    super.visitVarInsn(Opcodes.ALOAD, 0);
+                    super.visitVarInsn(Opcodes.ALOAD, 1);
+                    super.visitLdcInsn("wait");
+                    h4("beforeWait", "(Loptimus/graph/OGSchedulerContext;Loptimus/graph/NodeTask;Ljava/lang/String;)V");
+                    hook("c.wait");
+                  }
+                }
+                if (cname.equals("optimus/graph/OGSchedulerContext") && m.equals("run") && name.equals("setCausality")) {
+                  super.visitVarInsn(Opcodes.ALOAD, 0);
+                  super.visitVarInsn(Opcodes.ALOAD, 1);
+                  h4("beforeRun", "(Loptimus/graph/OGSchedulerContext;Loptimus/graph/NodeTask;)V");
                 }
                 super.visitMethodInsn(op, owner, name, d, itf);
                 if (cname.equals("optimus/graph/OGSchedulerContext") && m.equals("run") && name.equals("tryRun")) hook("c.tryRun");

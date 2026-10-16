@@ -10,6 +10,51 @@ All paths are under `optimus/platform/projects/core/src/main/scala/optimus/graph
 
 The whole lifecycle lives in one `volatile int _state` mutated with CAS loops (`updateState`, `tryUpdateState`). The low five bits are the run state: `STARTED`, `NOT_RUNNABLE`, `DONE_FLAG`, failed, hide-exception. Higher bits are orthogonal flags: scenario-dependent, cache-invalidated, tracking, adapted by a plugin, visited-gray/black for graph walks, and so on.
 
+```java
+// NodeTask.java, distilled. All transitions are CAS loops on one int.
+static final int STATE_STARTED      = 1;   // run() has been entered at least once
+static final int STATE_NOT_RUNNABLE = 2;   // clear = eligible to be picked off a queue
+static final int STATE_DONE_FLAG    = 4;   // has a result or exception
+static final int STATE_DONE = STATE_DONE_FLAG | STATE_NOT_RUNNABLE;   // "done" is TWO bits
+private static final int STATE_INVALID_CACHE = 0x40;                  // set by the cache/tracker, not the scheduler
+
+protected final int updateState(int set, int clear) {      // unconditional: whatever is there, set/clear bits
+  int prev, next;
+  do { prev = _state; next = (prev | set) & ~clear; } while (!state_h.compareAndSet(this, prev, next));
+  return prev;                                               // callers decide from the PREVIOUS value
+}
+private int tryUpdateState(int set, int clear) {           // conditional: refuses once DONE is observed
+  int prev, next;
+  do {
+    prev = _state;
+    if ((prev & STATE_DONE) == STATE_DONE) return prev;
+    next = (prev | set) & ~clear;
+  } while (!state_h.compareAndSet(this, prev, next));
+  return prev;
+}
+
+// The one CAS everything else leans on: a task on two queues, or handed out twice, runs once.
+protected final int tryRun() { return updateState(STATE_STARTED | STATE_NOT_RUNNABLE, 0); }
+// OGSchedulerContext.run():  if ((ntsk.tryRun() & STATE_NOT_RUNNABLE) == 0) { ... ntsk.run(this) ... }
+
+// Two siblings that do the same job, one check-then-act, one re-checking inside the loop (compare: R8).
+final void markAsRunnable()    { if (!isDoneOrRunnable()) updateState(0, STATE_NOT_RUNNABLE); }
+final boolean tryMarkAsRunnable() { return !isDone(tryUpdateState(0, STATE_NOT_RUNNABLE)); }
+
+// Predicates with different masks; a state like DONE_FLAG|STARTED answers them differently.
+public final boolean isDone()   { return (_state & STATE_DONE) == STATE_DONE; }
+public final boolean isDoneEx() { return (_state & (STATE_DONE_FLAG | STATE_INVALID_CACHE)) != 0; }
+final boolean isRunnable()      { return (_state & STATE_NOT_RUNNABLE) == 0; }
+
+// Completion: book-keeping first, then the state CAS (the publish barrier), then notify.
+protected final void complete(EvaluationQueue eq, int doneState) {
+  OGTrace.completed(eq, this);                               // stats visible before anyone can read the result
+  int prev = tryUpdateState(doneState, clearFlags);          // STATE_DONE or STATE_DONE_FAILED
+  if (isDone(prev)) logAndDie(new GraphException("Cannot complete node twice!"));   // process-fatal
+  notifyWaiters(eq);
+}
+```
+
 **Parallels.** `java.util.concurrent.FutureTask` (state word with CAS transitions), `CompletableFuture` (result plus a lock-free completion-callback stack), Rust's `Future` plus a `Waker`. The closest is Kotlin coroutines' `DispatchedTask`/`JobSupport`: state machine, children, cancellation all in one object.
 
 **Where it differs.** `FutureTask` has four states and one transition path. `NodeTask` has 23 flag bits and many writers: the scheduler (`tryRun`, `markAsRunnable`), the cache (`invalidateCache` clears `DONE_FLAG`), plugins (`markAsAdapted`), the dependency tracker, graph walkers (`VISITED_*`). The one rule that matters: `run()` is guarded by the CAS in `tryRun` that sets `NOT_RUNNABLE`; everything downstream assumes a task that fails that CAS was not run twice. "Done" is `DONE_FLAG | NOT_RUNNABLE`, two bits, so a writer that clears one can produce a state the predicates disagree about.
@@ -20,6 +65,42 @@ The whole lifecycle lives in one `volatile int _state` mutated with CAS loops (`
 
 `NodeTask._waiters` holds who to notify on completion. It is a tagged union: `null`, a single `NodeAwaiter`, an `NWList` (immutable singly linked list), or the sentinel `completed`. `tryAddToWaiterList` copies-and-CASes; `notifyWaiters` swaps in `completed` and walks what it got. A registration that loses to completion returns false and the caller invokes the callback itself, so every waiter is called exactly once.
 
+```java
+// NodeTask.java, distilled.
+private transient volatile Object _waiters;   // null | NodeAwaiter | NWList | completed (sentinel)
+protected static final Object completed = new Object();
+
+public final boolean tryAddToWaiterList(NodeAwaiter waiter) {
+  waiter.setWaitingOn(this);                   // forward edge for cycle detection, set optimistically
+  while (true) {
+    Object prev = _waiters;
+    if (prev == completed) { waiter.setWaitingOn(null); return false; }   // lost: caller must notify itself
+    Object next = (prev == null) ? waiter : new NWList(waiter, asList(prev));   // persistent cons, LIFO
+    if (waiters_h.compareAndSet(this, prev, next)) return true;
+  }
+}
+
+private void notifyWaiters(EvaluationQueue eq) {
+  Object ws;                                   // atomically seal the list: nobody can register after this
+  do { ws = _waiters; } while (!waiters_h.compareAndSet(this, ws, completed));
+  for (NodeAwaiter w : walk(ws)) {             // synchronously, on the completing thread
+    w.setWaitingOn(null);
+    w.onChildCompleted(eq, this);              // default impl below; eq may be a scheduler, not a context
+  }
+}
+
+// The contract every caller follows: register, and if that fails, call back inline.
+public final void continueWith(NodeAwaiter waiter, EvaluationQueue eq) {
+  if (!tryAddToWaiterList(waiter)) waiter.onChildCompleted(eq != null ? eq : OGSchedulerContext.current(), this);
+}
+
+// Default reaction of a parent node: become runnable again and get back on a queue. [MUST_ENQUEUE]
+@Override protected void onChildCompleted(EvaluationQueue eq, NodeTask child) {
+  markAsRunnable();
+  eq.enqueue(null, this);                      // the completer's queue, i.e. some other thread's deque
+}
+```
+
 **Parallels.** `CompletableFuture`'s Treiber stack of `Completion` nodes with the `null`/stack/done states; `AbstractQueuedSynchronizer`'s CLH queue; JavaScript promise reaction lists. The exactly-once-via-CAS contract is the same one as in `CompletableFuture.uniPush`.
 
 **Where it differs.** Callbacks run synchronously on the completing thread (`onChildCompleted`), and the default callback is "mark me runnable and enqueue me on the *completer's* queue". There is a stack-depth guard (`delayOnChildCompleted`, `proxyChainStackLimit`) rather than a trampoline. `continueWithLast` appends by rebuilding the list, O(n), for the rare "notify me after everyone else" case. Waiters are usually `NodeTask`s themselves but can be `SyncFrame`s (see §5) or ad hoc `NodeAwaiter`s.
@@ -29,6 +110,52 @@ The whole lifecycle lives in one `volatile int _state` mutated with CAS loops (`
 ## 3. The work-stealing deque: a Chase–Lev variant with at-least-once semantics
 
 `OGSchedulerContext.WorkQueue` is a circular array with an owner-only `_top` and a volatile `_base`. The owner pushes and pops at the top; thieves CAS a slot to null at the base and advance `_base` under `synchronized (this)`. Growth copies live tasks into a doubled array and swaps. A sync frame can fence the owner off tasks below a captured `_top` (`currentLocalQueueMarker`), and `scanToFindWork` does a linear, causality-checked search for the desperate case.
+
+```java
+// OGSchedulerContext.WorkQueue, distilled.
+private NodeTask[] _q = new NodeTask[64];     // power of two; index & (length-1)
+private volatile int _base;                   // thieves take here
+private int _top;                             // owner only; plain field, published by TSO + the slot CAS
+
+final void localPush(NodeTask task) {         // owner
+  if ((_top - _base) >= mask) growArray(_base - 1);           // grow before full; copies live tasks, may re-copy stolen ones
+  queue_h.setOpaque(_q, _top & mask, task);
+  _top = _top + 1;
+  if (_top == Integer.MAX_VALUE) resetBounds(mask);           // one-shot: _top &= mask; _base &= mask (see R2)
+}
+
+final NodeTask localPop(int topLimit) {       // owner; topLimit is a sync frame's fence
+  int top = _top - 1;
+  if (topLimit > top || top < _base) return null;             // direct comparisons, not differences
+  NodeTask r = (NodeTask) queue_h.get(_q, top & mask);
+  if (r != null && queue_h.compareAndSet(_q, top & mask, r, null)) _top = top;
+  return r;                                   // NOTE: returned even if the CAS failed; tryRun arbitrates (R7)
+}
+
+final NodeTask tryToSteal() {                 // any thread
+  synchronized (this) {                       // thieves serialised; FJP uses a CAS on base instead
+    int base = _base;
+    NodeTask r = (NodeTask) queue_h.getVolatile(_q, base & mask);
+    if (r != null && queue_h.compareAndSet(_q, base & mask, r, null)) { base_h.setOpaque(this, base + 1); return r; }
+  }
+  return null;
+}
+
+// "Unstable value!" in the source: with grow/steal races it can overstate pending work.
+final int size() { return _top - _base; }
+```
+
+And the fence that ties the deque to the sync stack (§5):
+
+```java
+// OGSchedulerContext.runAndWait, distilled: when this frame must not run work from older frames,
+// remember where the queue was and only pop above it.
+if (!prevNode.executionInfo().atMostOneWaiter() || syncStack.count > Settings.syncStackSafetyLimit) {
+  currentCausalityID += 1;
+  currentLocalQueueMarker = localQ.getTop();   // an absolute index remembered outside the queue
+}
+drainQueue(ntsk, currentLocalQueueMarker);     // -> localQ.localPop(currentLocalQueueMarker) ...
+```
 
 **Parallels.** `ForkJoinPool.WorkQueue` (same shape, same "owner at top, thieves at base", same `& mask` indexing), .NET `ThreadPool`'s `WorkStealingQueue`, Tokio's `Local` run queue, Go's per-P run queue. The class comment cites the Chase–Lev and "idempotent work stealing" papers and explains why it departs from them.
 
@@ -42,6 +169,52 @@ The whole lifecycle lives in one `volatile int _state` mutated with CAS loops (`
 
 Thread count is governed by an *ideal* (`optimus.gthread.ideal`, cores by default), a single *spinning thread* id used as a gate so that at most one new thread is being ramped up at a time, and an idle pool capped at twice the ideal. New workers are injected only by `addWorkerIfNeeded`, which under `limitThreads` counts waiters against the ideal.
 
+```java
+// OGScheduler.java, distilled.
+private final Object _lock = new OGSLock();                 // the big lock; ~23 synchronized sites
+private final Contexts _workers, _waiters, _idlePool, _externallyBlocked;   // IndexedArrayList<Context>
+private final WorkQueue _qqueue;                            // global quick queue; "owner" = whoever holds _lock
+private final PriorityQueue<NodeTask> _queue;               // priority != 0 (batchers); only under _lock
+private volatile int _spinningThreadID;                     // 0 = nobody spinning; the ramp-up gate
+
+public final void enqueue(NodeTask ntsk) {                  // from a non-graph thread or across causality
+  synchronized (_lock) {
+    for (Context ctx : waiters)                             // first: hand it to a blocked thread that may take it
+      if (canTake(ntsk, ctx.threadID, ctx.awaitedCausalityID)) { wakeupThread(ntsk, ctx); return; }
+    if (ntsk.priority() == 0) _qqueue.localPush(ntsk); else _queue.offer(ntsk);
+    addWorkerIfNeeded();
+  }
+}
+
+private boolean addWorkerIfNeeded() {                       // under _lock
+  if (_spinningThreadID != 0) return false;                 // one ramp-up at a time
+  int active = _workers.count + _waiters.count;
+  if (Settings.limitThreads && active >= _idealCount) return false;   // waiters count against the ideal (see R10)
+  if (_workers.count >= _idealCount) return false;
+  return injectThread(null);                                // pops the idle pool or new OGThread().start(), still under _lock
+}
+
+// A helper thread's life: run what it can, spin if it is the spinner, else park in the idle pool.
+class OGLogicalThread implements Runnable { public void run() {
+  while (true) {
+    NodeTask t = spin(ctx, null);                           // findWork() in a Thread.yield() loop while _spinningThreadID == me
+    if (t == null) t = nextStepForWorkingThread(ctx, null); // under _lock: last look, then move to idle/shutdown
+    if (t != null) { ec.drainQueue(t, -1); continue; }
+    while (ctx.parked) LockSupport.parkNanos(ONE_SECOND);   // idle; woken by injectThread/shutdown
+    if (ctx.shutdown) break;
+  }
+}}
+
+// IndexedArrayList, the thread sets: packed array, O(1) swap-remove, index cached on the item.
+public final boolean tryRemove(T item) {
+  int i = item.index;
+  if (i < 0 || i >= count || q[i] != item) return false;
+  count--; q[i] = q[count]; q[i].index = i; q[count] = null; item.index = -1;   // last item moves into the hole
+  return true;
+}
+public final void foreach(Consumer<T> c) { for (T x : q) { if (x == null) break; c.accept(x); } }   // no lock of its own
+```
+
 **Parallels.** ForkJoinPool's `ctl` word and "signalWork" ramp-up (one activator at a time), Go's `spinning M` (at most GOMAXPROCS/2 spinning, the rest parked), Tokio's single "searching" worker gate, .NET's hill-climbing thread injection. The idle pool with `parkNanos(1 s)` is the classic "keep a few warm threads" trick.
 
 **Where it differs.** FJP and Go are lock-free on the hot path; here `enqueue` from outside, every wake-up, thread injection, stall handling, cycle detection and the stalled callbacks all run under one `synchronized (_lock)` (23 sites). The spinner uses `Thread.yield()` in a loop rather than `onSpinWait` plus timed park. Waiting threads are first-class citizens of the pool: a thread blocked in a sync wait is still "in the graph", helps by stealing, and counts toward the ideal.
@@ -54,6 +227,47 @@ Optimus code can call `node.get` from inside a running node. That blocks the thr
 
 The defence is *causality*. Each sync frame that could matter bumps `currentCausalityID` (a depth) on the context; every task the thread runs is stamped `(threadID, depth)` into `NodeTask._causality` (two 16-bit halves of one int). `canTake(task, threadID, depth)` lets a thread at depth `d` take only tasks stamped with its own id at depth ≥ `d`, or tasks with no stamp at all; the forward-chain walk in `wait()` re-stamps the chain so the awaited work is always takeable; `poisonCausality` marks work that nobody with a sync stack may touch. The whole thing is a cheap, conservative approximation of "would running this put me below myself?"
 
+```java
+// OGSchedulerContext.runAndWait, distilled: block-by-helping with a sync frame.
+public final void runAndWait(NodeTask ntsk) {
+  NodeTask prevNode = _currentNode;                          // the node that called .get
+  prevNode.setWaitingOn(ntsk);                               // forward edge: prevNode -> ntsk
+  if (syncStack.isEmpty()) _scheduler.enterGraph(_context, false);   // user thread joins the pool
+  SyncFrame frame = syncStack.push(prevNode);                // frames are pooled objects, reused after pop
+  if (!prevNode.executionInfo().atMostOneWaiter() || syncStack.count > syncStackSafetyLimit) {
+    currentCausalityID += 1;                                 // depth, not identity
+    currentLocalQueueMarker = localQ.getTop();
+  }
+  ntsk.tryAddToWaiterList(frame);                            // frame.onChildCompleted -> scheduler.awakeOnComplete(ctx)
+  drainQueue(ntsk, currentLocalQueueMarker);                 // help: run ntsk and whatever is above the fence
+  while (!ntsk.isDoneEx()) {                                 // isDoneEx: DONE_FLAG *or* INVALID_CACHE
+    NodeTask other = _scheduler.wait(ntsk, _context, currentCausalityID);   // steal/scan/park, causality-checked
+    drainQueue(other, currentLocalQueueMarker);
+  }
+  // finally: restore causality/marker, prevNode.setWaitingOn(null), syncStack.pop(), maybe exitGraph
+}
+
+// The stamp, written in OGSchedulerContext.run() for every task this thread runs...
+final void setCausality(int causality, int threadID) { _causality = (causality & 0xFFFF) | (threadID << 16); }
+final int causalityID()       { return _causality & 0xFFFF; }
+final int causalityThreadID() { return _causality >> 16; }   // arithmetic shift (see R1)
+final void poisonCausality()  { setCausality(1, Integer.MAX_VALUE); }   // "nobody with a sync stack may take this"
+
+// ...and the check, OGScheduler.canTake: may a thread at depth `causalityID` run `task`?
+static boolean canTake(NodeTask task, int threadID, int causalityID) {
+  if (causalityID == 0) return true;                         // no sync stack: anything goes
+  int tid = task.causalityThreadID(), cid = task.causalityID();
+  return (cid == 0 && tid == 0)                              // never stamped
+      || (causalityID <= cid && (tid == threadID || tid == 0));   // my own work, from this depth or deeper (see R9)
+}
+
+// wait(): before parking, walk the awaited chain (Floyd) re-stamping it so its tail is takeable by me.
+for (NodeTask t = awaitTask.getWaitingOn(); t != null && t != fast; t = t.getWaitingOn()) {
+  t.setCausality(ctx.awaitedCausalityID, ctx.threadID);
+  if (t.isRunnable() && t.valueWasRequested()) return t;     // run the end of my own chain myself
+}
+```
+
 **Parallels.** FJP's join helping (`tryHelpStealer`, `helpComplete`) only helps with tasks that are descendants of the joined task; Go's scheduler simply forbids blocking a P and hands the M off. Causality is closer to the "lock levels" trick in deadlock-avoidance schemes: a monotone number per stack that bounds what you may wait on. Loom's answer, used in the `loom-on` build, is to let the carrier go and never block the thread at all; that is why `limitThreads` is tied to `useVirtualThreads`.
 
 **Where it differs.** Depth is not identity: two frames of the same thread at the same depth share a stamp. The stamp lives on the task and outlives the frame that wrote it. Under `limitThreads` no spinner with causality 0 is guaranteed to exist, so work that no waiter may take relies on other recovery. See R1, R9, R10.
@@ -63,6 +277,33 @@ The defence is *causality*. Each sync frame that could matter bumps `currentCaus
 ## 6. Stalls, batching and the out-of-work listeners
 
 When the last working thread cannot find anything to run, the graph has *stalled*. That is a feature, not a failure: plugins such as the DAL batcher register `OutOfWorkListener`s and use the stall as the moment to fire a batch of deferred requests, so the engine is a natural batching system in the style of Haxl or Facebook's `DataLoader`. Listeners have priorities and are called in passes; a pass stops when a callback added work. `mustCallDelay`/`mustWaitDelay` add timers via `ScheduledNodeTask`.
+
+```java
+// OGScheduler.findWork (desperate path, under _lock) and runOnStalledCallbacks, distilled.
+if (isStalling(ctx)) {                                   // I am the last working thread and found nothing
+  while (runOnStalledCallbacks()) {                      // each pass may add work; re-scan after each
+    if ((t = _qqueue.scanToFindWork(ctx.threadID, ctx.awaitedCausalityID)) != null) return t;
+    if ((t = findWorkFromLowPriorityQueue(ctx)) != null) return t;
+  }
+  if (_workers.count == 1 && _runCycleDetectionOnStall) {   // still stuck: look for cycles, once per wait
+    _waiters.foreach(this::detectCycles);
+    _evalAsyncTrackedNodes.foreach(tracked -> detectCycles(tracked.task));   // its own monitor is not taken here (R3)
+  }
+}
+
+private boolean runOnStalledCallbacks() {                // still under _lock (TODO OPTIMUS-17080)
+  _onStalledCallbacksInProgress = true;                  // adds during the pass go to a pending list...
+  for (var cb : _onStalledCallbacks) cb.checkForNewWork(this);   // ...but this for-each has no such protection (F2)
+  int before = _queue.size() + _qqueue.size();
+  OutOfWorkListener cb; int priority = _onStalledCallbacks.peek().priority();
+  while ((cb = _onStalledCallbacks.peek()) != null && (cb.priority() == priority || !newWorkAdded)) {
+    _onStalledCallbacks.poll();                          // a callback is deregistered once called
+    cb.onGraphStalled(this, outstandingTasks);           // user code, e.g. "send the DAL batch now"
+    newWorkAdded = (_queue.size() + _qqueue.size()) != before;   // size() of a deque as a count
+  }
+  ...
+}
+```
 
 **Parallels.** Haxl's "run until blocked, then fetch everything blocked on", GraphQL DataLoader's "batch at the end of the tick", Seastar's idle-time hooks.
 
@@ -74,6 +315,31 @@ When the last working thread cannot find anything to run, the graph has *stalled
 
 Every blocked thread's awaited task has a `waitingOn` chain. `findWorkOnForwardChain` walks it with a fast and a slow pointer (Floyd), re-stamping causality and returning the first runnable node. If the walk finds a cycle, `detectCyclesAndRecover` runs under the static `NodeTask._visitLock`: it collects the cycle, tries plugin-specific recovery (`tryToRecoverFromCycle`, used by the cross-scenario proxies to loosen a tweak-dependency mask), and otherwise completes one node with `CircularReferenceException`. The lock order `_lock` → `_visitLock` is documented in a comment and is what makes the recovery enqueue safe.
 
+```java
+// NodeTask.visitForwardChain (Floyd) and detectCyclesAndRecover, distilled.
+NodeTask slow = this, fast = this;
+do {
+  v.add(slow);
+  slow = slow.getWaitingOn();
+  if (fast != null) { fast = fast.getWaitingOn(); if (fast != null) fast = fast.getWaitingOn(); }
+} while (slow != null && slow != fast);                  // slow == fast: a cycle; slow == null: chain ended
+// Note what is NOT a cycle here: a sync frame suspended lower on the same thread (R9 forms no waitingOn loop).
+
+private static final ReentrantLock _visitLock = new ReentrantLock();   // static: one walker per JVM, all schedulers
+
+void detectCyclesAndRecover(EvaluationQueue eq) {
+  _visitLock.lock();                                     // caller already holds this scheduler's _lock [SEE_XSFT_GLOBAL_SCHEDULER_ENQUEUE]
+  try {
+    if (isDone()) return;
+    var chain = visitForwardChain();
+    if (chain.marker < 0) return;                        // no cycle
+    for (NodeTask t : cycle(chain))
+      if (t.tryToRecoverFromCycle(mask, eq)) return;     // plugin hook; may enqueue, i.e. take some scheduler's _lock (R4)
+    chain.get(chain.marker).completeWithException(new CircularReferenceException(chain), eq);   // break it
+  } finally { _visitLock.unlock(); }
+}
+```
+
 **Parallels.** Deadlock detection by wait-for graph (database lock managers, Go's `runtime.checkdead`), run on a timer when progress stops rather than on every wait. Completing a node with an exception to break the cycle is the same move as a database aborting the youngest transaction.
 
 **What to check.** The lock order with more than one scheduler alive; which structures the walk reads without their own lock; the asymmetry between what is detected (waitingOn cycles) and what can actually deadlock (sync-stack inversions that form no cycle). See R3, R4, R9.
@@ -81,6 +347,28 @@ Every blocked thread's awaited task has a `waitingOn` chain. `findWorkOnForwardC
 ## 8. Cancellation: scopes, not interrupts
 
 `CancellationScope` is a tree; cancelling a scope marks it and every child. The scheduler checks `cs.isCancelled()` in `run()` before running a node and completes it with the cancellation cause instead. Nodes already running are not interrupted; `waitForCancelledNodesToStop` polls the contexts' current nodes and sync frames until none of them is in the scope, with a check for the self-deadlock of waiting on a cancelled node that is on your own sync stack.
+
+```java
+// OGSchedulerContext.run(), distilled: cancellation is checked once, before run(), never during.
+private void run(NodeTask ntsk) {
+  int prev = ntsk.tryRun();
+  if ((prev & STATE_NOT_RUNNABLE) != 0) return;          // someone else has it
+  _currentNode = ntsk;                                   // plain write; read by other threads' polling loops
+  ntsk.setCausality(currentCausalityID, _context.threadID);
+  try {
+    if (ntsk.scenarioStack().cancelScope().isCancelled()) ntsk.cancelInsteadOfRun(this);   // completes with the cause
+    else ntsk.run(this);
+  } catch (Throwable ex) {
+    ntsk.completeWithException(ex, this);               // fatal if ntsk already completed itself (F1)
+  } finally { _currentNode = null; }
+}
+
+// OGScheduler.waitForCancelledNodeToStop, distilled: poll until the node is off every stack.
+while ((frame.getCurrentNodeTask() == node || owner.getCurrentNodeTask() == node) && node.notWaitingForCancelledNodesToStop()) {
+  if (frame instanceof SyncFrame && node.visitForwardChain().containsEQ(callerNode)) throw new GraphInInvalidState("would deadlock");
+  Thread.yield();                                        // plain-field reads in a spin loop (R5)
+}
+```
 
 **Parallels.** Go's `context.Context` tree, Kotlin's structured concurrency `Job` hierarchy, .NET `CancellationToken`. The "cooperative, checked at scheduling points" model is the standard one.
 
@@ -97,6 +385,21 @@ Every blocked thread's awaited task has a `waitingOn` chain. `findWorkOnForwardC
 ## 10. Diagnostics, profiling and the agent
 
 A lot of the code is observability: `OGTrace`/`OGLocalTables` per-thread profiling tables acquired and released on graph entry/exit, `PNodeTask` profile records, breadcrumbs, stall printing with rate limits, `GraphDiagnostics` dumps, `InfoDumper.graphPanic` as the kill switch. The entity agent (`entityagent/`) rewrites classes at load time: it adds fields to `TPDMask`, instruments `NodeTask`, and in the Loom build rewrites async code to continuations. The class you read is not quite the class that runs.
+
+```java
+// NodeTask.logAndDie and OGScheduler.panic, distilled: the fail-fast path.
+private static boolean inLogAndDie = false;              // static, non-volatile, never reset
+
+private void logAndDie(Throwable e) {
+  synchronized (NodeTask.class) {
+    if (inLogAndDie) { log.error("logAndDie called recursively!"); return; }   // the guard (F1b)
+    inLogAndDie = true;
+    log.error(...); log.error(GraphDiagnostics.getGraphState());
+    InfoDumper.graphPanic("logAndDie", ..., 121, wrapped, this);   // -> crumbs, dump, Runtime.exit(121); each step can throw
+  }
+}
+// OGLogicalThread.run():  try { ...loop... } catch (Throwable e) { panic(e); }   // panic -> graphPanic(66); no finally removes ctx from _workers (F2b)
+```
 
 **Parallels.** JFR-style per-thread buffers, async-profiler integration, the "crash the process on invariant violation" discipline of Erlang supervisors or SQLite's `SQLITE_CORRUPT`.
 
