@@ -140,7 +140,7 @@ stateDiagram-v2
     [*] --> null
     null --> single: tryAddToWaiterList CAS
     single --> list: tryAddToWaiterList CAS wrap + cons
-    list --> list: tryAddToWaiterList CAS continueWithLast: rebuild On
+    list --> list: tryAddToWaiterList CAS continueWithLast - rebuild On
     null --> completed: notifyWaiters swap
     single --> completed: notifyWaiters swap, then call the one waiter
     list --> completed: notifyWaiters swap, then walk and call each
@@ -276,15 +276,15 @@ stateDiagram-v2
     [*] --> outside
     outside --> workers: enterGraph first runAndWait on this thread
     workers --> outside: exitGraph sync stack empty again
-    workers --> waiters: nextStepForWorkingThread: no work, awaitTask != null parked = true
+    workers --> waiters: nextStepForWorkingThread - no work, awaitTask != null parked = true
     waiters --> workers: tryWakeupThread enqueue handed me a task, or my awaited node completed parked = false, unpark
     waiters --> workers: deadlock timer found runnable work on my chain
-    workers --> idle: nextStepForWorkingThread: no work, helper, idle.count < 2×ideal
+    workers --> idle: nextStepForWorkingThread - no work, helper, idle.count < 2×ideal
     idle --> workers: injectThread addWorkerIfNeeded / evaluateOnGraphThread... becomes the spinner
-    workers --> dead: nextStepForWorkingThread: idle pool full, or shutdown ctx.shutdown = true
+    workers --> dead: nextStepForWorkingThread - idle pool full, or shutdown ctx.shutdown = true
     workers --> blocked: doBlockingAction → exitGraphexternallyBlocked
     blocked --> workers: enterGraphwasExternallyBlocked
-    workers --> dead: panic thread dies, Context NOT removed: F2b
+    workers --> dead: panic thread dies, Context NOT removed - F2b
     note right of waiters
         Under limitThreads, waiters count
         against the ideal in addWorkerIfNeeded.

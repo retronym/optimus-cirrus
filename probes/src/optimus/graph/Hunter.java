@@ -386,6 +386,7 @@ public final class Hunter {
         statEnqueued.incrementAndGet();
       }
       ec.enqueue(this, c);
+      if (H6.ON) H6.at(c, H6.St.ENQUEUED);
     }
 
     final long sumKids() {
@@ -421,6 +422,7 @@ public final class Hunter {
     @Override
     public void run(OGSchedulerContext ec) {
       runs.incrementAndGet();
+      if (H6.ON && H6.at(this, H6.St.RUNNING)) H6.busyLeaf(this);
       if (g.sp.fails[i]) {
         statFailedLeaves.incrementAndGet();
         throw new RuntimeException("hunter-leaf-fail-" + i);
@@ -451,11 +453,14 @@ public final class Hunter {
     @Override
     public void run(OGSchedulerContext ec) {
       runs.incrementAndGet();
+      if (H6.ON) H6.at(this, H6.St.RUNNING_INGRAPH);
       for (int j = 0; j < nk(); j++) enq(ec, kid(j));
       for (int j = 0; j < nk(); j++) {
         HN c = kid(j);
+        if (H6.ON) H6.at(this, H6.St.SYNC_WAIT);
         ec.runAndWait(c);
         combine(c, ec);
+        if (H6.ON) H6.propagate(this, c);
       }
       finish(ec, sumKids());
     }
@@ -471,6 +476,7 @@ public final class Hunter {
     @Override
     public void run(OGSchedulerContext ec) {
       runs.incrementAndGet();
+      if (H6.ON) H6.at(this, H6.St.RUNNING_INGRAPH);
       pending.set(nk());
       for (int j = 0; j < nk(); j++) enq(ec, kid(j));
       for (int j = 0; j < nk(); j++) register(j, ec);
@@ -484,6 +490,7 @@ public final class Hunter {
     @Override
     protected void onChildCompleted(EvaluationQueue eq, NodeTask child) {
       noteNotified(child);
+      if (H6.ON) H6.at(this, H6.St.ON_CHILD_COMPLETED);
       combineInfo(child, eq);
       if (pending.decrementAndGet() == 0) finish(eq, sumKids());
     }
@@ -532,10 +539,13 @@ public final class Hunter {
       pending.set(nAsync + 1);
       for (int j = 0; j < nk(); j++) enq(ec, kid(j));
       for (int j = 0; j < nk(); j++) if (!g.sp.syncEdge[i][j]) register(j, ec);
+      if (H6.ON) H6.at(this, H6.St.RUNNING_INGRAPH);
       for (int j = 0; j < nk(); j++)
         if (g.sp.syncEdge[i][j]) {
+          if (H6.ON) H6.at(this, H6.St.SYNC_WAIT);
           ec.runAndWait(kid(j));
           combine(kid(j), ec);
+          if (H6.ON) H6.propagate(this, kid(j));
         }
       if (pending.decrementAndGet() == 0) finish(ec, sumKids());
     }
@@ -548,6 +558,7 @@ public final class Hunter {
     @Override
     protected void onChildCompleted(EvaluationQueue eq, NodeTask child) {
       noteNotified(child);
+      if (H6.ON) H6.at(this, H6.St.ON_CHILD_COMPLETED);
       if (pending.decrementAndGet() == 0) finish(eq, sumKids());
     }
   }
@@ -601,7 +612,240 @@ public final class Hunter {
     @Override
     protected void onChildCompleted(EvaluationQueue eq, NodeTask child) {
       noteNotified(child);
+      if (H6.ON) H6.at(this, H6.St.ON_CHILD_COMPLETED);
       if (pending.decrementAndGet() == 0) finish(eq, sumKids());
+    }
+  }
+
+
+  // ================================================================== H6 cancellation at every lifecycle state
+
+  /**
+   * -Dhunter.h6=true. Every iteration picks one target scope and one node lifecycle state and
+   * cancels the scope exactly when the first node of that scope reaches the state: NEW (before the
+   * clients start), ENQUEUED (right after a parent enqueues it, from the graph thread), RUNNING (a
+   * leaf: cancelled from another thread while it busy-loops 1 ms), RUNNING_INGRAPH (a non-leaf
+   * cancels its own scope and calls waitForCancelledNodesToStop from inside run()), SYNC_WAIT
+   * (another thread cancels 200 us after a sync node enters runAndWait on a kid), ON_CHILD_COMPLETED
+   * (inside the callback, possibly on a non-graph thread) and COMPLETED (after the clients are
+   * done). waitForCancelledNodesToStop is then called from a non-graph thread with a 2 s bound. Sync
+   * parents rethrow a kid's exception as a real get() would, so a node cancelled under a sync stack
+   * must surface as an exception, never a hang.
+   */
+  static final class H6 {
+    static final boolean ON = Boolean.getBoolean("hunter.h6");
+
+    enum St { NEW, ENQUEUED, RUNNING, RUNNING_INGRAPH, SYNC_WAIT, ON_CHILD_COMPLETED, COMPLETED }
+
+    static volatile G g;
+    static volatile OGScheduler s;
+    static volatile ScheduledThreadPoolExecutor ext;
+    static volatile St st;
+    static volatile int scope;
+    static final java.util.concurrent.atomic.AtomicBoolean fired = new java.util.concurrent.atomic.AtomicBoolean();
+    static volatile HN trigger, syncWaiter;
+    static volatile long leafEndNs, wfcnsEndNs;
+    static final ExecutorService waiter = Executors.newSingleThreadExecutor(r -> {
+      Thread t = new Thread(r, "hunter-h6wait");
+      t.setDaemon(true);
+      return t;
+    });
+    static final List<Future<?>> pend = java.util.Collections.synchronizedList(new ArrayList<>());
+    static final long[] firedBy = new long[St.values().length], notFired = new long[St.values().length], wfMax = new long[St.values().length],
+        wfTimeouts = new long[St.values().length];
+    static final AtomicLong syncExc = new AtomicLong(), syncVal = new AtomicLong(), syncNotDone = new AtomicLong(), wfEarly = new AtomicLong(),
+        inGraphWaits = new AtomicLong(), inGraphGuard = new AtomicLong(), inGraphWaitMaxMs = new AtomicLong(), propagated = new AtomicLong();
+
+    /** Make sure the seed has 1..3 scopes (separate stream: the DAG itself is unchanged). */
+    static void addScopes(Spec sp) {
+      if (sp.scopeRoot.length > 0 || sp.n < 3) return;
+      Random r = new Random(sp.seed * 31 + 6);
+      List<Integer> roots = new ArrayList<>();
+      int ns = 1 + r.nextInt(3);
+      for (int k = 0; k < ns; k++) {
+        int c = 1 + r.nextInt(sp.n - 1);
+        if (!roots.contains(c)) roots.add(c);
+      }
+      roots.sort(null);
+      sp.scopeRoot = roots.stream().mapToInt(Integer::intValue).toArray();
+      sp.cancelDelayUs = new int[sp.scopeRoot.length];
+      sp.scopeParent = new int[sp.scopeRoot.length];
+      sp.scopeOf = new int[sp.n];
+      sp.scopeOf[0] = -1;
+      for (int i = 1; i < sp.n; i++) {
+        int ps = sp.scopeOf[sp.primaryParent[i]];
+        int idx = roots.indexOf(i);
+        if (idx >= 0) {
+          sp.scopeParent[idx] = ps;
+          sp.scopeOf[i] = idx;
+        } else sp.scopeOf[i] = ps;
+      }
+    }
+
+    static boolean under(Spec sp, int sc, int target) {
+      for (int k = sc; k >= 0; k = sp.scopeParent[k]) if (k == target) return true;
+      return false;
+    }
+
+    static void begin(G gg, OGScheduler ss, ScheduledThreadPoolExecutor e, int iter) {
+      g = gg;
+      s = ss;
+      ext = e;
+      int n = St.values().length;
+      st = St.values()[iter % n];
+      scope = gg.sp.scopeRoot.length == 0 ? -1 : (iter / n) % gg.sp.scopeRoot.length;
+      trigger = syncWaiter = null;
+      leafEndNs = wfcnsEndNs = 0;
+      fired.set(scope < 0);
+      if (st == St.NEW && scope >= 0 && fired.compareAndSet(false, true)) {
+        firedBy[st.ordinal()]++;
+        cancelAndWait(0);
+      }
+    }
+
+    static CancellationScope cs() {
+      return g.scopeSS[scope].cancelScope();
+    }
+
+    /** Lifecycle point; returns true if this call fired the trigger. */
+    static boolean at(HN x, St where) {
+      if (where != st || fired.get() || x.g != g) return false;
+      if (where == St.RUNNING && !(x instanceof LeafN)) return false;
+      int sc = g.sp.scopeOf[x.i];
+      if (sc < 0 || !under(g.sp, sc, scope)) return false;
+      if (!fired.compareAndSet(false, true)) return false;
+      firedBy[where.ordinal()]++;
+      trigger = x;
+      switch (where) {
+        case ENQUEUED, ON_CHILD_COMPLETED -> {
+          cs().cancel("h6 " + where);
+          cancelAndWait(-1);
+        }
+        case RUNNING -> {
+          if (!(x instanceof LeafN)) return false;
+          cancelAndWait(0); // from another thread, while the leaf busy-loops
+        }
+        case RUNNING_INGRAPH -> {
+          var c = cs();
+          c.cancel("h6 in-graph");
+          long t0 = System.nanoTime();
+          try {
+            s.waitForCancelledNodesToStop(c); // from inside run(): the caller marks itself, must not wait for itself
+          } catch (GraphInInvalidState e) {
+            // OPTIMUS-43488 guard: a cancelled node lower on this thread's own sync stack. Documented behaviour; the
+            // exception completes this node (and, through the sync parents, its cancelled ancestors).
+            if (String.valueOf(e.getMessage()).startsWith("Waiting for cancelled node in sync stack")) inGraphGuard.incrementAndGet();
+            throw e;
+          } finally {
+            cancelAndWait(-1);
+          }
+          long ms = (System.nanoTime() - t0) / 1_000_000;
+          inGraphWaits.incrementAndGet();
+          inGraphWaitMaxMs.accumulateAndGet(ms, Math::max);
+        }
+        case SYNC_WAIT -> {
+          syncWaiter = x;
+          var c = cs();
+          ext.schedule(() -> c.cancel("h6 sync-wait"), 200, TimeUnit.MICROSECONDS);
+          cancelAndWait(400);
+        }
+        default -> {}
+      }
+      return true;
+    }
+
+    static void busyLeaf(HN x) {
+      long end = System.nanoTime() + 1_000_000;
+      while (System.nanoTime() < end) Thread.onSpinWait();
+      leafEndNs = System.nanoTime();
+    }
+
+    /** delayUs < 0: the scope is already cancelled; else cancel after delayUs from the waiter thread. Then waitForCancelledNodesToStop, 2 s bound. */
+    static void cancelAndWait(long delayUs) {
+      St at = st;
+      CancellationScope c = cs();
+      pend.add(waiter.submit(() -> {
+        try {
+          if (delayUs > 0) Thread.sleep(0, (int) Math.min(999_999, delayUs * 1000));
+          if (delayUs >= 0) c.cancel("h6 " + at);
+          long t0 = System.nanoTime();
+          Future<?> w = Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "hunter-h6wfcns");
+            t.setDaemon(true);
+            return t;
+          }).submit(() -> s.waitForCancelledNodesToStop(c));
+          try {
+            w.get(2, TimeUnit.SECONDS);
+          } catch (java.util.concurrent.TimeoutException te) {
+            wfTimeouts[at.ordinal()]++;
+            finding("H6_WFCNS_TIMEOUT", "state=" + at + " trigger=" + trigger + " waitForCancelledNodesToStop did not return in 2 s");
+            for (var e : Thread.getAllStackTraces().entrySet())
+              if (e.getKey().getName().equals("hunter-h6wfcns")) for (StackTraceElement f : e.getValue()) System.out.println("    wfcns " + f);
+            w.get(30, TimeUnit.SECONDS);
+          }
+          wfcnsEndNs = System.nanoTime();
+          long ms = (wfcnsEndNs - t0) / 1_000_000;
+          wfMax[at.ordinal()] = Math.max(wfMax[at.ordinal()], ms);
+          if (at == St.RUNNING && leafEndNs == 0 && trigger != null && !trigger.isDone()) {
+            wfEarly.incrementAndGet(); // returned while the cancelled leaf was still in its busy loop
+            finding("H6_WFCNS_EARLY", "waitForCancelledNodesToStop returned while " + trigger + " (cancelled scope) was still running");
+          }
+        } catch (Throwable t) {
+          finding("H6_WAITER_THREW", at + " " + t);
+          t.printStackTrace(System.out);
+        }
+        return null;
+      }));
+    }
+
+    /** Sync parent: a kid that ended with an exception is rethrown, as get() would. */
+    static void propagate(HN parent, HN kid) {
+      if (kid.isDoneWithException()) {
+        propagated.incrementAndGet();
+        Throwable e = kid.exception();
+        if (e instanceof RuntimeException re) throw re;
+        throw new RuntimeException(e);
+      }
+    }
+
+    static void end(G gg) throws Exception {
+      if (st == St.COMPLETED && scope >= 0 && fired.compareAndSet(false, true)) {
+        firedBy[st.ordinal()]++;
+        int[] before = new int[gg.sp.n];
+        for (int i = 0; i < gg.sp.n; i++) before[i] = gg.nodes[i].completes.get();
+        cancelAndWait(0);
+        drain();
+        for (int i = 0; i < gg.sp.n; i++)
+          if (gg.nodes[i].completes.get() != before[i]) finding("H6_COMPLETED_CHANGED", gg.nodes[i] + " completed again after its scope was cancelled post-completion");
+      }
+      if (!fired.get()) notFired[st.ordinal()]++;
+      drain();
+      HN w = syncWaiter;
+      if (w != null) {
+        if (!w.isDone()) syncNotDone.incrementAndGet();
+        else if (w.isDoneWithException()) syncExc.incrementAndGet();
+        else syncVal.incrementAndGet();
+      }
+    }
+
+    static void drain() throws Exception {
+      List<Future<?>> fs;
+      synchronized (pend) {
+        fs = new ArrayList<>(pend);
+        pend.clear();
+      }
+      for (Future<?> f : fs) f.get(60, TimeUnit.SECONDS);
+    }
+
+    static String summary() {
+      StringBuilder sb = new StringBuilder();
+      for (St x : St.values())
+        sb.append(" h6.").append(x).append("=fired:").append(firedBy[x.ordinal()]).append(",notReached:").append(notFired[x.ordinal()]).append(",wfcnsMaxMs:")
+            .append(wfMax[x.ordinal()]).append(",timeouts:").append(wfTimeouts[x.ordinal()]);
+      sb.append(" h6syncWaiter=exception:").append(syncExc).append(",value:").append(syncVal).append(",notDone:").append(syncNotDone)
+          .append(" h6wfcnsEarly=").append(wfEarly).append(" h6inGraphWaits=").append(inGraphWaits).append(",maxMs:").append(inGraphWaitMaxMs)
+          .append(" h6propagated=").append(propagated).append(" h6expectedGIIS=").append(inGraphGuard);
+      return sb.toString().trim();
     }
   }
 
@@ -653,13 +897,19 @@ public final class Hunter {
           continue;
         }
         if (sp.fails[i] && e != null && String.valueOf(e.getMessage()).startsWith("hunter-leaf-fail-")) continue;
+        if (H6.ON && taint[i] && e instanceof GraphInInvalidState && String.valueOf(e.getMessage()).startsWith("Waiting for cancelled node in sync stack")) continue;
+        if (H6.ON && taint[i] && isCancellation(e)) {
+          statCancelledNodes.incrementAndGet();
+          continue;
+        }
+        if (H6.ON && e != null && String.valueOf(e.getMessage()).startsWith("hunter-leaf-fail-")) continue; // propagated by a sync parent
         if (reported++ < 5) finding("UNEXPECTED_EXCEPTION", id + " cancelledScope=" + cancelled[i] + " ex=" + e);
         continue;
       }
       if (sp.fails[i]) finding("FAILING_LEAF_SUCCEEDED", id);
       long local = x.sumKids();
       if (x.value != local && reported++ < 5) finding("LOCAL_SUM_MISMATCH", id + " value=" + x.value + " recomputed=" + local);
-      if (!taint[i] && x.value != sp.expected[i] && reported++ < 5)
+      if (!taint[i] && !H6.ON && x.value != sp.expected[i] && reported++ < 5)
         finding("VALUE_MISMATCH", id + " value=" + x.value + " expected=" + sp.expected[i]);
     }
     for (int c = 0; c < sp.clients; c++) {
@@ -966,8 +1216,9 @@ public final class Hunter {
     int maxN = Integer.getInteger("hunter.maxN", 0);
     long wdMs = Long.getLong("hunter.wdMs", 10_000);
     long budgetMs = Long.getLong("hunter.budgetMs", 2500);
-    int maxIters = Integer.getInteger("hunter.iters", 200), minIters = Integer.getInteger("hunter.minIters", 3);
+    int maxIters = Integer.getInteger("hunter.iters", 200), minIters = Integer.getInteger("hunter.minIters", H6.ON ? 2 * H6.St.values().length : 3);
     Spec sp = generate(seed, maxN);
+    if (H6.ON) H6.addScopes(sp);
     EvaluationContext.initializeWithoutRuntime();
     OGScheduler s = (OGScheduler) EvaluationContext.scheduler();
     ScenarioStack base = EvaluationContext.scenarioStack();
@@ -1028,11 +1279,13 @@ public final class Hunter {
       G g = new G(sp, s, ext, base);
       Random ir = new Random(seed ^ (iter * 0x632BE59BD9B4E019L));
       List<ScheduledFuture<?>> cancels = new ArrayList<>();
-      for (int k = 0; k < sp.scopeRoot.length; k++) {
-        var cs = g.scopeSS[k].cancelScope();
-        long d = (long) (sp.cancelDelayUs[k] * (0.25 + 1.5 * ir.nextDouble()));
-        cancels.add(ext.schedule(() -> cs.cancel("hunter cancel"), d, TimeUnit.MICROSECONDS));
-      }
+      if (H6.ON) H6.begin(g, s, ext, iter);
+      else
+        for (int k = 0; k < sp.scopeRoot.length; k++) {
+          var cs = g.scopeSS[k].cancelScope();
+          long d = (long) (sp.cancelDelayUs[k] * (0.25 + 1.5 * ir.nextDouble()));
+          cancels.add(ext.schedule(() -> cs.cancel("hunter cancel"), d, TimeUnit.MICROSECONDS));
+        }
       CountDownLatch done = new CountDownLatch(sp.clients);
       long ts = System.nanoTime();
       for (int c = 0; c < sp.clients; c++) {
@@ -1051,6 +1304,7 @@ public final class Hunter {
       if (!done.await(wdMs, TimeUnit.MILLISECONDS)) hang(g, s, "clients not done (iter " + iter + ")", wdMs);
       long ms = (System.nanoTime() - ts) / 1_000_000;
       iterMs.add(ms);
+      if (H6.ON) H6.end(g);
       for (ScheduledFuture<?> f : cancels)
         if (!f.cancel(false)) {
           try {
@@ -1091,6 +1345,7 @@ public final class Hunter {
         + " maxSettleMs=" + maxSettleMs + " ogLiveBefore=" + liveBefore + " ogLiveAfter=" + liveAfter + " findings=" + findingCount.get());
     System.out.println("KV h5 " + fin + " violations=" + (fin.violations().isEmpty() ? "none" : String.join(",", fin.violations())));
     System.out.println("KV h4 " + HunterH4.summary());
+    if (H6.ON) System.out.println("KV h6 " + H6.summary());
     System.out.flush();
     int code = 0;
     boolean oracle = false, h5only = false;
@@ -1529,7 +1784,7 @@ public final class Hunter {
                   Map<String, String> kv = kvs(List.of("KV " + l.substring(12)));
                   lastSeed = Long.parseLong(kv.get("seed"));
                   String c = kv.get("class");
-                  synchronized (cur) {
+                  if (!c.equals("RESCUED-SEED")) synchronized (cur) {
                     cur.counts[c.startsWith("PASS") ? 0 : c.startsWith("HANG:") ? 1 : c.startsWith("HANG-RESCUED") ? 3 : 2]++;
                     cur.cls.merge(c + (c.startsWith("PASS") || kv.get("findings") == null || kv.get("findings").isEmpty() ? "" : "{" + kv.get("findings") + "}"), 1, Integer::sum);
                   }
@@ -1633,7 +1888,7 @@ public final class Hunter {
     for (String f : flags(cfg).split(" ")) if (!f.isEmpty()) argv.add(f);
     argv.add("-Dhunter.wdMs=" + wdMs);
     if (maxN > 0) argv.add("-Dhunter.maxN=" + maxN);
-    for (String k : new String[] {"hunter.budgetMs", "hunter.iters", "hunter.minIters", "hunter.asyncMode", "hunter.stallDumpMs"})
+    for (String k : new String[] {"hunter.budgetMs", "hunter.iters", "hunter.minIters", "hunter.asyncMode", "hunter.stallDumpMs", "hunter.h6", "hunter.h4", "hunter.h7"})
       if (System.getProperty(k) != null) argv.add("-D" + k + "=" + System.getProperty(k));
     for (String a : cmd.substring(5).trim().split("\\s+")) argv.add(a);
     argv.add("--child");
@@ -1667,12 +1922,14 @@ public final class Hunter {
   static Res classify(long seed, String cfg, int maxN, int exit, List<String> lines, long wall, String log) {
     Map<String, String> kv = kvs(lines);
     boolean infoDumper = false, invalid = false, twice = false, panic = false;
+    int giis = 0;
     String invalidMsg = null;
     List<String> fk = new ArrayList<>();
     String hangCls = null, stallCls = null;
     for (String l : lines) {
       if (l.contains("ExceptionInInitializerError") || (l.contains("InfoDumper") && l.contains("Exception"))) infoDumper = true;
-      if (l.contains("GraphInInvalidState") && !l.startsWith("\tat") && !l.startsWith("    at")) {
+      if (l.contains("GraphInInvalidState constructed")) giis++;
+      if (l.contains("GraphInInvalidState") && !l.startsWith("\tat") && !l.startsWith("    at") && !l.startsWith("FINDING UNEXPECTED_EXCEPTION") && !l.contains("constructed - logging")) {
         invalid = true;
         if (invalidMsg == null) invalidMsg = l.trim();
       }
@@ -1694,7 +1951,11 @@ public final class Hunter {
     else if (exit == 2) cls = "H5";
     else cls = "CRASH(exit=" + exit + ")";
     if (!fk.isEmpty()) det.append(" findings=").append(String.join(",", fk));
+    long expected = Long.parseLong(kv.getOrDefault("h6expectedGIIS", "0"));
+    if (giis > expected) invalid = true;
+    if (giis > 0) det.append(" giis=").append(giis).append("(expected ").append(expected).append(')');
     if (invalid) {
+      if (invalidMsg == null) invalidMsg = "GraphInInvalidState constructed x" + giis;
       cls = cls.equals("PASS") ? "ASSERT" : cls + "+ASSERT";
       det.append(" invalidState=\"").append(invalidMsg.length() > 160 ? invalidMsg.substring(0, 160) : invalidMsg).append('"');
     }
