@@ -1,6 +1,27 @@
 # Cirrus core scheduler review
 
-Scope: `optimus/platform/projects/core/src/main/scala/optimus/graph/{OGScheduler.java, OGSchedulerContext.java, NodeTask.java, NodeAwaiter.java, Scheduler.scala, Node.scala, OGLocalTables.java, Settings.java}` plus `optimus/core/IndexedArrayList.java` and the cycle-recovery entry points in `cache/NCProxies.java`. Read, not run (see the build section at the end for what could be executed locally). Line numbers refer to the current worktree.
+## Executive summary
+
+The scheduler's hot paths are sound. Under jcstress, Lincheck, enumerated interleavings and a fuzzer sweep of some 3,000 runs, the work-stealing deque never lost a task, the waiter-notification protocol never missed or duplicated a callback, no wakeup was lost, and a 60-minute soak showed no drift in heap, threads or callback bookkeeping. The by-design double hand-outs in the deque are real and were measured; they are safe because `tryRun` arbitrates.
+
+The serious problems are in the *sync-stack* machinery (a thread that blocks inside a node and helps by running other work) and in the *failure paths*, and most of them end in a permanent hang rather than an error:
+
+| Id | Severity | One line | Reproducer |
+|----|----------|----------|------------|
+| R9 | H | Causality ids are stack depths, not frame identities. A task stamped by a popped frame, or never stamped, is handed to a thread parked in an unrelated frame and then sync-waits on a node suspended lower on that thread's own stack. No cycle, nothing runnable, permanent. Also occurs under virtual threads. | `probes/run-hunter.sh inv i1-a0-d0-lt1`, `inv u:...` |
+| R10 / R10b | H | With `limitThreads` (default), global work that no waiter may take starves next to parked idle workers; the last thread can exit with runnable work still queued. `limitThreads=false` never hangs. | `inv n2:i1-a0-d0-lt1`; h6 seed 13 |
+| R1 | H | Thread id packed into 16 bits of the causality word: past 32,768 contexts a thread refuses its own work, past 65,536 ids alias. Permanent hang on a fan-in shape. | T1 |
+| R4 | M | Cross-scheduler cycle recovery inverts `_lock`/`_visitLock` and deadlocks on the first attempt. | T4 |
+| R8 | M | `markAsRunnable` is check-then-act against an unconditional CAS; racing `complete` leaves a done node runnable and runs it again. | jcstress H2e, 2% of samples |
+| R2 | M | `WorkQueue.resetBounds` at `Integer.MAX_VALUE` invalidates a sync frame's saved queue marker, fencing the owner off its own queue. | T2 |
+| R11 | M | `waitForCancelledNodesToStop` from a graph thread spins forever past the existing self-deadlock guard. | h6 seed 25 |
+| F1b / F2b / F3b | M | The kill paths assume `graphPanic` cannot throw. When it does, a double completion is swallowed and a never-reset guard silences every later kill; a worker that panics or fails to start stays counted in `_workers`, which disables stall callbacks for good. | T7, T8, T9 |
+
+Everything else (R3, R5–R7, F2–F8, I1–I6) is hygiene, cost, or a sharp edge that is safe today; several first-draft claims were withdrawn or downgraded once probed and are marked as such.
+
+Three fixes would remove most of the risk: (1) stamp a frame identity rather than a depth and, before parking, refuse to run a task whose dependencies include a node on the parking thread's stack, which the fuzzer's SELF_WAIT oracle shows is checkable with no false positives; (2) re-check the global queue whenever a thread moves to waiting or the pool empties, injecting a causality-0 worker above the ideal if untakeable work exists; (3) make the kill paths robust with `Runtime.halt` as a last resort and remove a context from `_workers` in a `finally`. R1, R4 and R8 are each a few lines.
+
+Scope: `optimus/platform/projects/core/src/main/scala/optimus/graph/{OGScheduler.java, OGSchedulerContext.java, NodeTask.java, NodeAwaiter.java, Scheduler.scala, Node.scala, OGLocalTables.java, Settings.java}` plus `optimus/core/IndexedArrayList.java` and the cycle-recovery entry points in `cache/NCProxies.java`. The code-reading sections were written first and then tested; the probe, model-checking and fuzzer sections record what each test showed. Line numbers refer to the current worktree.
 
 Severity key: **H** likely to bite in production, **M** real but needs specific conditions, **L** hygiene / latent.
 
