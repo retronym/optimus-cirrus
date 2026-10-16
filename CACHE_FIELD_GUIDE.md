@@ -198,7 +198,7 @@ sequenceDiagram
     U->>Q: addTweaks(K := v)  (registerOrEnqueueAction under queueLock)
     Q->>Q: recordStart: wait until no evaluation is in flight
     Q->>G: cancel the phase's CancellationScope, waitForCancelledNodesToStop on every scheduler
-    Note over G: nodes still on a stack finish or are cancelled; suspended orphans are cancelled when they try to run
+    Note over G: nodes still on a stack finish or are cancelled, suspended orphans are cancelled when they try to run
     Q->>T: MutableSSCacheID.put(K, v)  (plain JHashMap write, no lock: the barrier is the lock)
     Q->>T: invalidateByKey(K): withFreshTraversalId, walk root_K → dependents, invalidateCache each, empty the tracks
     Q->>U: invalidation callbacks (inside the update)
