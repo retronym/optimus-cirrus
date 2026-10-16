@@ -1,0 +1,485 @@
+# Cirrus core scheduler review
+
+## Executive summary
+
+The scheduler's hot paths are sound. Under jcstress, Lincheck, enumerated interleavings and a fuzzer sweep of some 3,000 runs, the work-stealing deque never lost a task, the waiter-notification protocol never missed or duplicated a callback, no wakeup was lost, and a 60-minute soak showed no drift in heap, threads or callback bookkeeping. The by-design double hand-outs in the deque are real and were measured; they are safe because `tryRun` arbitrates.
+
+The serious problems are in the *sync-stack* machinery (a thread that blocks inside a node and helps by running other work) and in the *failure paths*, and most of them end in a permanent hang rather than an error:
+
+| Id | Severity | One line | Reproducer |
+|----|----------|----------|------------|
+| [R9](#r9) | H | Causality ids are stack depths, not frame identities. A task stamped by a popped frame, or never stamped, is handed to a thread parked in an unrelated frame and then sync-waits on a node suspended lower on that thread's own stack. No cycle, nothing runnable, permanent. Also occurs under virtual threads. | `probes/run-hunter.sh inv i1-a0-d0-lt1`, `inv u:...` |
+| [R10](#r10) / [R10b](#r10b) | H | With `limitThreads` (default), global work that no waiter may take starves next to parked idle workers; the last thread can exit with runnable work still queued. `limitThreads=false` never hangs. | `inv n2:i1-a0-d0-lt1`; h6 seed 13 |
+| [R1](#r1) | H | Thread id packed into 16 bits of the causality word: past 32,768 contexts a thread refuses its own work, past 65,536 ids alias. Permanent hang on a fan-in shape. | T1 |
+| [R4](#r4) | M | Cross-scheduler cycle recovery inverts `_lock`/`_visitLock` and deadlocks on the first attempt. | T4 |
+| [R8](#r8) | M | `markAsRunnable` is check-then-act against an unconditional CAS; racing `complete` leaves a done node runnable and runs it again. | jcstress H2e, 2% of samples |
+| [R2](#r2) | M | `WorkQueue.resetBounds` at `Integer.MAX_VALUE` invalidates a sync frame's saved queue marker, fencing the owner off its own queue. | T2 |
+| [R11](#r11) | M | `waitForCancelledNodesToStop` from a graph thread spins forever past the existing self-deadlock guard. | h6 seed 25 |
+| [F1b](#f1b) / [F2b](#f2b) / [F3b](#f3b) | M | The kill paths assume `graphPanic` cannot throw. When it does, a double completion is swallowed and a never-reset guard silences every later kill; a worker that panics or fails to start stays counted in `_workers`, which disables stall callbacks for good. | T7, T8, T9 |
+
+Everything else ([R3](#r3), [R5](#r5)–[R7](#r7), [F2](#f2)–[F8](#f8), [I1](#i1)–[I6](#i6)) is hygiene, cost, or a sharp edge that is safe today; several first-draft claims were withdrawn or downgraded once probed and are marked as such.
+
+Three fixes would remove most of the risk: (1) stamp a frame identity rather than a depth and, before parking, refuse to run a task whose dependencies include a node on the parking thread's stack, which the fuzzer's SELF_WAIT oracle shows is checkable with no false positives; (2) re-check the global queue whenever a thread moves to waiting or the pool empties, injecting a causality-0 worker above the ideal if untakeable work exists; (3) make the kill paths robust with `Runtime.halt` as a last resort and remove a context from `_workers` in a `finally`. [R1](#r1), [R4](#r4) and [R8](#r8) are each a few lines.
+
+Scope: `optimus/platform/projects/core/src/main/scala/optimus/graph/{OGScheduler.java, OGSchedulerContext.java, NodeTask.java, NodeAwaiter.java, Scheduler.scala, Node.scala, OGLocalTables.java, Settings.java}` plus `optimus/core/IndexedArrayList.java` and the cycle-recovery entry points in `cache/NCProxies.java`. The code-reading sections were written first and then tested; the probe, model-checking and fuzzer sections record what each test showed. Line numbers refer to the current worktree.
+
+Severity key: **H** likely to bite in production, **M** real but needs specific conditions, **L** hygiene / latent.
+
+## Races and correctness
+
+<a id="r1"></a>
+### R1 (H, permanent hang demonstrated end to end) Causality packs the thread id into 16 bits and overflows
+
+`NodeTask.setCausality` (NodeTask.java:198) stores `(causality & 0xFFFF) | (threadID << 16)` and `causalityThreadID()` (line 194) recovers it with an arithmetic `>> 16`. `threadID` comes from `OGScheduler.threadCounter`, which is bumped for every injected worker **and** every `newEvaluationContext` call (OGScheduler.java:490), i.e. every thread that ever initialises an `EvaluationContext`. Idle worker contexts are reused, but user threads are not: a server whose request pool churns threads, or a long test run, will pass 32,767 ids.
+
+- From id 32,768 the sign bit is set, `>> 16` sign-extends, and `taskTID == threadID` in `canTake` (OGScheduler.java:1096) is never true for that thread's own sync-stack work. With `limitThreads` the work can only be taken by a causality-0 thief, so a graph where every thread is on a sync stack stalls until the 1 s deadlock timer walks the forward chain.
+- From id 65,536 the shift wraps completely and ids alias. `canTake` then lets thread N take work stamped by thread N+65536 under a sync stack, which is exactly the sync-stack deadlock the causality check exists to prevent.
+- `poisonCausality` (line 205) uses `Integer.MAX_VALUE << 16`, which extracts as thread id -1. Works by accident.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant T as Thread T (id ≥ 32768)<br/>sync frame at depth 1
+    participant S as OGScheduler
+    participant Q as global quick queue
+    T->>T: run(N): N.setCausality(1, T) → packed as (T << 16) | 1, sign bit set
+    T->>T: N suspends on a child, child completes elsewhere → N.onChildCompleted
+    T->>S: enqueue(N) from the completer (causality > 0 path)
+    S->>S: canTake(N, T, 1): N.causalityThreadID() = (T<<16)>>16 = T − 65536 ≠ T → false for its own owner
+    S->>Q: push N (nobody waiting may take it)
+    Note over T,Q: all threads on sync stacks, N off every forward chain (fan-in shape)
+    T->>T: fullWait: 1 s timer walks the chain, N is not on it
+    Note over T,Q: idle workers stay parked (limitThreads), permanent hang
+```
+
+Tier 1 probe T1 ran the real scheduler with `threadCounter` primed to 32,768 and 65,530. Every re-enqueue from a causality > 0 frame is then refused by its own thread (100% vs 0–1% at baseline) and lands on the global queue. Shapes where the refused node stays on the waiting thread's forward chain still finish at baseline speed, because `wait()`'s chain walk hands it back. A shape where it does not (a sync node whose fan-in awaiter registers on all children, so siblings are off the chain) hangs permanently: runnable nodes sit in the global quick queue, every thread is in `waitThreads`, `workThreads` is empty, idle workers stay parked, and the 1 s deadlock timer never recovers it because it only walks forward chains. `ideal=1` hangs every time; `ideal=2` with 4 clients hangs in 1–3 of 3 runs. So this is not timer-paced slowness but a deadlock, reached by nothing more than enough threads having initialised an `EvaluationContext` over the process lifetime.
+
+Fix: widen `_causality` to a `long` (the field is transient and already padded by the volatile `_state` neighbour), or mask with `>>> 16` and assert/saturate at 0xFFFF in `injectThread`/`newEvaluationContext`.
+
+Related (H7, low): each `OGScheduler` has its own `threadCounter` starting at 1, but stamps travel with nodes across schedulers, so thread 3 of scheduler A and thread 3 of scheduler B alias. The H4 oracle counted cross-scheduler alias takes in 72 of 120 multi-scheduler runs; no hang was traced to one, but a process-wide counter would remove the ambiguity. The 60-minute soak measured the counter growing at 1–1.7 ids per second under client churn, so R1's 32,768 is 5–9 hours away at that rate.
+
+<a id="r2"></a>
+### R2 (M) `WorkQueue` index reset breaks sync-frame markers
+
+`OGSchedulerContext.WorkQueue` compares `_top` and `_base` directly (`_top <= _base` at line 372, `top < _base` at 413 and 426, `(top - base) >= mask` at 442) and relies on `resetBounds` (455) firing exactly when `_top == Integer.MAX_VALUE` (452). The reset itself is sound (probe W1a) and tasks are not lost across it (W1s). The problem is state held outside the queue: a sync frame that captured `currentLocalQueueMarker = localQ.getTop()` before the reset (OGSchedulerContext.java:744) now holds a marker larger than any future `_top`, so `localPop(queueMarker)` returns null for the rest of that frame (demonstrated by W1b). The thread cannot drain its own local queue and depends on thieves or the deadlock timer. The growArray comment ("we cannot move _top because of causality mark") shows this was known for the resize case but not the reset case.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant F as sync frame<br/>(runAndWait)
+    participant Q as owner's WorkQueue
+    F->>Q: marker = getTop()   → MAX_VALUE − 6
+    F->>Q: localPush × 6 (children)
+    Note over Q: 6th push: _top == MAX_VALUE → resetBounds: _top &= mask (63), _base &= mask
+    F->>Q: localPop(marker = MAX_VALUE − 6)
+    Q-->>F: null   (topLimit > top − 1 for every future _top)
+    Note over F,Q: owner fenced off its own queue for the rest of the frame,<br/>children run only via thieves or the 1 s timer (ideal=1: hang)
+```
+
+Tier 1 probe T2 confirms it on the real scheduler: with the thread's local queue primed at `MAX_VALUE - 10`, a root that enqueues four fan-outs and `runAndWait`s them captures a marker of `MAX_VALUE - 6`, the sixth push fires the reset (`top=257 base=53`), and the owner is fenced off its own 200 tasks. With `ideal=1` the run hangs (1 of 800 leaves run before the 20 s watchdog); with `ideal=2` it completes in normal time but the owner runs 1 of 800 leaves instead of 200, a thief does the rest.
+
+A second case I reported in the first draft, `_base` passing `MAX_VALUE` via the "+1 overrun" state described in the class comment, is withdrawn: probe W1a' could not produce `base > top` in 20,000 pop-vs-steal races. The comment describes an older `localPop` that did not CAS; the current one does, so the overrun state is unreachable and the reset guard is always hit.
+
+At 100 k–1 M pushes per second per thread, 2^31 is hours to a day. Fix as in `ForkJoinPool.WorkQueue`: compare differences only (`top - base <= 0`), make the sync-frame marker a difference too, and delete `resetBounds`. Direct comparisons of the raw indices remain a hygiene issue even though no path currently wraps them.
+
+<a id="r3"></a>
+### R3 (L) `_evalAsyncTrackedNodes` is iterated without its monitor
+
+Adds/removes synchronise on the list itself (any thread, including non-graph threads via `enqueueAndTrackCompletion`, OGScheduler.java:528), but `findWork` iterates it with `foreach` under `_lock` only (line 1181) and `generateSchedulerStatus` iterates with no lock (1769). `IndexedArrayList.tryRemove` moves the last element into the hole and `add` replaces the array, so a concurrent iteration can skip or double-visit. Benign today because `detectCycles` is idempotent, but a one-line `synchronized` fixes it.
+
+<a id="r4"></a>
+### R4 (M, deadlock demonstrated) Lock order inversion across schedulers in cycle recovery
+
+`findWorkOnForwardChain` takes `_lock` then the process-wide static `NodeTask._visitLock` (OGScheduler.java:1293, comment [SEE_XSFT_GLOBAL_SCHEDULER_ENQUEUE]). Under `_visitLock`, `tryToRecoverFromCycle` enqueues (`NCProxies.java:223, 489`); with `keepTaskSchedulerAffinity`, auxiliary schedulers, or the fresh `OGScheduler` that `Scheduler.default` creates per call when the default is single-threaded (Scheduler.scala:111), that enqueue can take a *different* scheduler's `_lock`. Two schedulers detecting cycles at once gives S1._lock → _visitLock → S2._lock against S2._lock → _visitLock → S1._lock. The comment's reasoning only covers one scheduler. Tier 1 probe T4 reproduces it on the first cross-scheduler recovery, every time, with or without an injected delay and with asserts on or off: two schedulers with `keepTaskSchedulerAffinity`, a two-node `waitingOn` cycle on each, and a `tryToRecoverFromCycle` that enqueues onto the other scheduler. `ThreadMXBean.findDeadlockedThreads` reports both clients: one blocked on the other scheduler's `_lock` in `OGScheduler.enqueue` (called from `tryToRecoverFromCycle` ← `detectCyclesAndRecover` ← `findWorkOnForwardChain`) while holding its own `_lock` and `_visitLock`; the other waiting for `_visitLock` while holding its own `_lock`. A control with only one scheduler cycling ran 50 rounds and 2,000 cross enqueues without deadlock. The recovery node is a stand-in for the real XSFT proxy recovery, but it enters `detectCyclesAndRecover` on the real path. Fix direction: drop `_visitLock` from the path that enqueues (collect the recovery actions under the lock, perform them after releasing it), or make `tryToRecoverFromCycle` defer cross-scheduler enqueues.
+
+<a id="r5"></a>
+### R5 (L) `waitForCancelledNodeToStop` spins on plain fields
+
+OGScheduler.java:1680–1702 loops on `frame.getCurrentNodeTask()` (plain read of `SyncFrame.ntsk`) and `owner.getCurrentNodeTask()` (plain read of `_currentNode`, whose writes in `OGSchedulerContext.run` at lines 835 and 872 are plain stores; only `runAndWait` uses the opaque VarHandle). Works because `Thread.yield()` is opaque to C2, not because the code is correct. Each iteration also does `visitForwardChain().containsEQ(callerNode)`, O(chain), and the spin is unbounded while the cancelled node is mid-computation. Use `getOpaque`/`setOpaque` consistently and back off to a timed park.
+
+<a id="r6"></a>
+### R6 (L, mechanism demonstrated) `SyncFrame` objects are reused while possibly still registered as waiters
+
+`runAndWait` registers the pooled `SyncFrame` via `tryAddToWaiterList(frame)` (OGSchedulerContext.java:755) and exits the wait loop on `isDoneEx()`, which includes `STATE_INVALID_CACHE`. `invalidateCache` (NodeTask.java:1140) sets that flag without notifying waiters. If it can hit an in-flight node (the tracking callers in `UserNodeTracker`/`TweakableTracker` look like they can), the frame is popped and reused for the next sync wait while still on the old node's waiter list; the old node's eventual `notifyWaiters` then calls `setWaitingOn(null)` and `onChildCompleted` on a frame that now describes a different wait. `awakeOnComplete` compares `ctx.awaitedTask == child`, so no spurious wake, and `result` throws after the exit, so this is a broken invariant rather than an observed bug. Probes W3e and W4a demonstrate both halves of the mechanism (stale waiter survives `invalidateCache`; popped frame is reused with `waitingOn` still set). Whether an in-flight node is ever invalidated in practice is still unconfirmed; worth a `schedulerAsserts` check that a popped frame has `_waitingOn == null`.
+
+## Foot-guns
+
+<a id="f1"></a>
+### F1 Several ordinary mistakes kill the process
+
+- Completing a node twice goes to `logAndDie` and exits with 121 (NodeTask.java:1274). `complete`/`completeWithResult` take no lock; only the `try*` variants synchronise, so "try" is safe only against other "try" calls.
+- `OGSchedulerContext.run` turns any `Throwable` from `ntsk.run` into `completeWithException` (line 869). A node that completes itself and *then* throws (including `StackOverflowError`/OOM after completion) therefore double-completes and exits the JVM.
+- Anything escaping `OGScheduler.wait` panics with 66 (line 929). That includes exceptions from `tryToRecoverFromCycle`, `BlockingWaitCounter.report` and plugin `onGraphStalled` callbacks.
+
+These are deliberate ("we are probably heading for a bad deadlock"), but the surface is wide. H8 added a fourth: under `-Xss256k` a `StackOverflowError` at about 241 nested sync frames lands inside `runAndWait`'s own `log.error("Caught an error in runAndWait…")`, logback's `ThrowableProxy` fails to initialise, every later log call with a throwable in that JVM throws `NoClassDefFoundError`, and all 2,000 nodes are left not done. `syncStackSafetyLimit` bumps causality at the configured depth but does nothing to reduce stack use, so it does not prevent this. At minimum the `run` catch should check `ntsk.isDone()` first and log instead of re-completing.
+
+<a id="f2"></a>
+### F2 Mutating the callback set from `checkForNewWork` throws CME → panic
+
+`runOnStalledCallbacks` iterates `_onStalledCallbacks` with for-each while calling `checkForNewWork` (OGScheduler.java:1475). `_lock` is reentrant, so a callback that adds or removes a listener from inside `checkForNewWork` gets `ConcurrentModificationException` from the `PriorityQueue` iterator. Only `onGraphStalled` has the pending-list protection. Tier 1 probe T8 shows the exception on the real stall path is raised on the spinning worker (`findWork` ← `spin` ← `OGLogicalThread.run`), not in `wait()`, and goes to `panic(66)`; the CME itself is never logged (visible only with `-Xlog:exceptions=info`).
+
+<a id="f2b"></a>
+### F2b (M) A worker that dies in `panic` stays registered, turning a failed kill into a permanent hang
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant W as og.worker (spinner)
+    participant S as OGScheduler state
+    participant C as client (parked waiter)
+    W->>S: findWork → runOnStalledCallbacks → CME from checkForNewWork loop
+    W->>W: OGLogicalThread.run catch → panic(66) → graphPanic throws
+    W--xW: thread unwinds and dies, no finally removes its Context
+    Note over S: _workers still lists the dead worker (count 1)
+    C->>S: fullWait timer: "_onStalledCallbacks non-empty and _workers.count == 0"? → false
+    Note over C: never woken, stalled-callback recovery never runs, permanent hang
+```
+
+Found by T8. When `panic` (and therefore `InfoDumper.graphPanic`) throws instead of exiting, the `OGLogicalThread` unwinds and the platform thread ends, but its `Context` is never removed from `_workers`. The status dump afterwards shows `workThreads 1 [og.worker-1-3]` for a thread that no longer exists, so `_workers.count` never reaches 0, the stalled-callback recovery in `fullWait` never fires, and the client parks forever. Same root cause as F1b: the kill paths assume `graphPanic` cannot throw. `OGLogicalThread.run` should remove its context (an `exitGraph`-style cleanup in a `finally`) before the thread dies, and the last resort after a failed `graphPanic` should be `Runtime.halt`.
+
+<a id="f3"></a>
+### F3 (M) Unbounded thread injection
+
+`evaluateOnGraphThreadAndTrackCompletion` always calls `injectThread(nodeTask)` (line 603): N concurrent calls are N platform threads regardless of ideal count. Tier 1 probe T9: 10,000 calls with blocking nodes produced 10,001 live `og.worker` threads at `ideal=2` and `ideal=18` alike (no OOM at `-Xss512k`); the pool shrank to the idle cap once released. Likewise `shutdown()` only parks the idle pool; `enqueue` after shutdown still spawns threads (W6c). And `Scheduler.default` allocates a new `OGScheduler` (registered in the weak map, consuming a scheduler id) on every call when the default is single-threaded (Scheduler.scala:111).
+
+<a id="f3b"></a>
+### F3b (M) A failed thread start leaves a phantom worker that disables stall callbacks for good
+
+Found by T9. At 15,000 calls macOS's per-process thread limit stops `new OGThread().start()` with "unable to create native thread", which propagates to the caller. By then `injectThread` (OGScheduler.java:655) has already added the `Context` to `_workers` with `thread == null` and `userEntry` set, and nothing removes it. After the latch was released and every node completed, `_workers.count` was still 2: the phantom context, plus a spinner that keeps spinning because another "worker" exists, at 0.76 CPU-seconds per second indefinitely. Because `_workers.count` never reaches 0, `isStalling` is never true and `onGraphStalled` callbacks never fire again: a sync `get` on a node that only a stall callback completes hangs (it completes in the 1,000-call control). Same shape as F2b (a dead worker still counted): `injectThread` should add the context only after `start()` succeeds, or remove it in a catch.
+
+<a id="f4"></a>
+### F4 (cosmetic) `asIfRunning` uses thread id 1
+
+OGScheduler.java:496 creates a `Context` with `threadID = 1`, which `threadCounter` also hands to the first real worker. Probe W6b shows nothing is ever stamped with it: `asIfRunning` only hosts enqueues, never runs nodes, so tasks leave with causality 0/0. Harmless today; a fresh id would make it robust against a future caller that does run something there.
+
+<a id="f5"></a>
+### F5 Behaviour depends on a build-time flag
+
+`useVirtualThreads` defaults to `LoomDefaults.enabled`, which is `true` in `entityagent/src/main/loom-on` and `false` in `loom-off`. `limitThreads = !useVirtualThreads` follows. Which source set a given jar was built from is invisible at runtime; `addWorkerIfNeeded`, `findWork`, `nextStepForWorkingThread` and the idle pool all branch on it. Log the effective values at scheduler start.
+
+<a id="f6"></a>
+### F6 The scheduler cannot be instantiated without the entity agent
+
+`OGScheduler`'s static initialiser calls `AgentInfo.agentInfo()` and `EntityAgent.retransform(ReentrantLock.class)` (lines 82–87). Every unit test of the scheduler needs `-javaagent`. See the build section.
+
+<a id="f7"></a>
+### F7 Invariants are only checked under `optimus.scheduler.asserts`
+
+Default off. With it off, `markAsRunnableAndEnqueue` on a node that still has `waitingOn` only logs (line 517), `IndexedArrayList.remove` silently no-ops on a missing item, and `wakeupThread` ignores a failed removal. There is no `src/test` for `core` in this export, so nothing here runs the asserting configuration.
+
+<a id="f8"></a>
+### F8 Minor
+
+- `OGSchedulerContext.hasEnoughWork()` NPEs off-graph (line 1027).
+- `_queue` (priority queue) is only purged of done tasks when `_workers.count == 0` (line 715); between stalls it retains completed nodes.
+- `Context.lastTask()` walks an unbounded forward chain (line 117); it is called from the sampling profiler's stack recorder.
+
+## Inefficiencies
+
+<a id="i1"></a>
+### I1 Every blocking wait pretty-prints the node and captures a stack trace
+
+`fullWait` builds `awaitTask.toString()` (a `PrettyStringBuilder` render) and `new Exception("Blocking Wait")` unconditionally (OGScheduler.java:948–949) before anyone checks whether the blocking-wait counter has a consumer; `BlockingWaitCounter.report` just forwards to `OGTrace.observer.writeEvent`. Probe W7 measured 0.25 µs for both on a trivial node with a shallow stack against a 29 µs median wait, so this is minor unless nodes pretty-print expensively (entity keys, args) or the stack is deep. Gate on the observer, or pass a supplier; cheap and strictly better.
+
+<a id="i2"></a>
+### I2 The spinner burns a core with `Thread.yield()`
+
+`spin` (line 864) yields in a tight loop whenever there are ≥2 workers and no work. One long-running node plus the spinner is a wasted core for the node's duration. `ForkJoinPool` spins briefly with `Thread.onSpinWait()` then parks with a timed wakeup; the same shape would keep the latency benefit without the steady-state cost.
+
+<a id="i3"></a>
+### I3 Thread start and unpark under the global lock
+
+`injectThread` calls `new OGThread(...).start()` (line 673) inside `synchronized (_lock)`, reached from every `enqueue`. Probe W6e measured a median 28 µs for an `enqueue` that creates a thread vs 12.5 µs for one that unparks an idle one, on macOS; the idle pool makes creation rare in steady state. Reserve the `Context` under the lock and start the thread after releasing it; same for `LockSupport.unpark` in `tryWakeupThread`. Low priority.
+
+<a id="i4"></a>
+### I4 Linear scans under `_lock`
+
+- `enqueue` scans all waiters for a `canTake` match on every global enqueue (line 581).
+- `findWorkFromLowPriorityQueue` is O(n) with iterator removal (line 1204).
+- `addOutOfWorkListenerImpl` does `PriorityQueue.contains` (line 1565) and `removeOutOfWorkListener` does `PriorityQueue.remove`; both O(n), so registering n batchers is O(n²).
+
+A side identity set for the callbacks and a per-causality index for waiters would remove the quadratic cases.
+
+<a id="i5"></a>
+### I5 Timer-driven recovery wakes every waiter every second
+
+With `schedulerRecoveryInWait` (default true) each blocked thread wakes every second (line 997), and once per second runs `findWorkOnForwardChain`, O(chain). Idle pool threads also wake every second (line 440). Hundreds of waiters means hundreds of forward-chain walks per second as background noise. One scheduled task per scheduler would do the same job.
+
+<a id="i6"></a>
+### I6 CAS on every owner pop
+
+`localPop` (line 410) CASes each pop; the TODO (OPTIMUS-28068) already notes this. Because `tryRun` is itself a CAS, the owner can use the FJP owner-pop protocol (one fence, no CAS) and tolerate the occasional double-dispatch that `tryRun` rejects. `tryToSteal` also serialises all thieves of a queue on `synchronized (this)` (line 390); CAS on `_base` is enough once slots are CASed to null.
+
+## Missing wins
+
+- Wrap-safe deque (R2) plus lock-free steal (I6) in one change, modelled on `ForkJoinPool.WorkQueue`, with the ABA concern discharged by the existing null-CAS on slots and the `tryRun` guard.
+- A long `_causality` (R1) and `threadCounter` as the only source of ids (F4).
+- `Thread.onSpinWait()` with a spin budget (I2) and plain `park()` for idle threads instead of `parkNanos(1 s)`.
+- Opaque VarHandle access for `_currentNode` and `SyncFrame.ntsk` everywhere, not just in `runAndWait` (R5).
+- A stress harness: fan-out/fan-in trees, deliberate sync stacks, cancellation mid-run, two schedulers, run under `-Doptimus.scheduler.asserts=true`. None of the findings above has a reproducer because this export ships no scheduler tests.
+
+## Method: tools and techniques
+
+Everything below the code-reading sections was produced by running the real scheduler classes, not copies, under conditions chosen to make each suspected hazard visible. The toolkit, in the order it was built (all under `probes/`):
+
+- **Local build without OBT.** Plain `scalac`/`javac` driven by shell scripts, Maven deps via coursier, 22 stub classes for internal libraries, the entity agent built into a jar and loaded with `-javaagent`. Every probe JVM uses the same flags as production would. Details in "Build and run".
+- **State priming by reflection.** Private fields (`WorkQueue._top/_base`, `OGScheduler.threadCounter`, `OGSchedulerContext.currentCausalityID`, `_lock`, `_workers`) are set directly, so a hazard that would take 2^31 pushes or 32 K thread creations to reach organically is reached in one line. Package-private members are reached by placing probe classes in `optimus.graph`.
+- **Schedule-driven step harness** (`Steps.java`). Two or more participants call `ctl.step()` between actions; a schedule string such as `A1 B1 B2 A2` decides the order, so an interleaving is a parameter rather than luck, and `permutations()` enumerates all of them. Used wherever the interesting window is between two calls the probe makes itself (W2a, W2b, W4b).
+- **Delay-injection agent** (`DelayAgent.java`, ASM). A second `-javaagent` rewrites `WorkQueue` at load time to call a hook after each slot read and before each CAS, array swap or `removeAt`. A probe arms the hook on its thread and the hook then goes through the step harness, which lets the schedule reach *inside* `tryToSteal`, `localPop`, `growArray` and `scanToFindWork` (W1c–e). Unarmed, the same hook can park for a random time (`-Dprobes.delay.maxNanos`) to widen interleavings in longer runs.
+- **Child-JVM-per-configuration.** `Settings` are `static final`, so each configuration (`gthread.ideal`, `limitThreads`, `scheduler.asserts`, delay) is a forked JVM with the flags inserted after `java`; the parent parses one `RESULT` line per child. Also how exit codes from `logAndDie`/`panic` are observed (T7, T8).
+- **Watchdog with classified dumps.** A hang is caught by a timer that prints `OGScheduler.toString()` and the stacks of worker and client threads, then classifies it from the scheduler state: causality stall (waiters present and runnable work on a queue), lost wakeup (awaited task done, context still parked, nobody working), or other.
+- **Oracles instead of expectations.** Each run checks root sums against a sequential evaluation of the same DAG, exactly-once completion, and after quiescence the thread-accounting invariants (no contexts left in `_workers`/`_waiters`, spinner id consistent, queues empty, no leaked `og.worker` threads).
+- **Model checking.** jcstress (forked VMs carry the entity agent) for the lock-free pairs: owner pop vs thief, grow vs steal, scan vs steal, waiter registration vs completion, state-flag races, with outcomes graded acceptable / interesting / forbidden. Lincheck's model-checking strategy against a sequential "multiset with at-least-once delivery" spec for `WorkQueue`, including a wrap-around variant starting near `Integer.MAX_VALUE`.
+- **Random-DAG fuzzing** (`Hunter.java`). Seeded generation of 10–2000-node DAGs mixing sync (`runAndWait` inside `run`), FSM (`continueWith`/`onChildCompleted`), promise-style completion from non-graph threads, async roots launched via `evaluateNodeAsync`, failing leaves and mid-run cancellation of random subtrees; swept across the configuration matrix with and without delay injection; failures re-run to test determinism and minimised by truncating the DAG.
+
+Each probe records one of three outcomes: *demonstrated* (the predicted mechanism was observed, with the state that proves it), *not reproduced* (the schedules or runs tried, and what was seen instead), or *quantified* (a cost measured rather than a bug shown). Claims in the code-reading sections that a probe contradicted were withdrawn rather than left standing.
+
+## Build and run
+
+The full `core` module and its 15 sibling modules compile locally with plain `scalac`/`javac`; no OBT, no entityplugin (core only needs the stagingplugin). Scripts, stubs and logs are under the session scratchpad `build/` directory (`fetch.sh`, `build.sh`, `build-smoke.sh`, `run-smoke.sh`). None of it touches the repo.
+
+What it took:
+
+- JDK 21 (Temurin). JDK 24+ fails in agent premain because `java24_compat.sc` is not in the export.
+- Scala 2.13.17+: the alarms plugin reflects on `PerRunReporting.nowarnAction`, which first exists there. MS builds with a patched scalac (unsealed `Profiler`, assignable `Run.profiler`); two alarms sources were overridden to drop the slow-compilation profiler.
+- `-Yimports:java.lang,scala,scala.Predef,optimus.scala212.DefaultSeq` for every module from `utils` up. Not documented anywhere; inferred from missing implicits.
+- Logback pinned to 1.2.13 (`CachedNamedConverter` reaches into a package-private field).
+- 22 stub classes for internal libraries (`msjava.*`, `com.ms.*`, the MS async-profiler fork, five `optimus.debug.Instrumented*` classes that live in the missing entityagent-ext jar). Three small source overrides (breadcrumbs `Properties`, instrumentation `DefensiveManagementFactory`, the alarms profiler).
+- Runtime: `-javaagent:entityagent.jar` is mandatory (`OGScheduler.<clinit>` fails fast without it, and the agent rewrites `NodeTask` at load time, so the reviewed source is not exactly what runs); `--add-exports` for `jdk.internal.vm`, `jdk.internal.misc`, `sun.management`; a `ServiceLoader` provider for `BreadcrumbsSetupFactory`; `-Doptimus.graph.async.profiler=false`.
+
+Smoke test (`smoke/Smoke.scala`): a hand-written `CompletableNode` fan-out/fan-in tree with async, sync-stack and mixed modes, N client threads, optional failing leaves, hang watchdog. All configurations passed with no hangs or wrong sums: default 18 threads 4.4 M nodes in 0.25 s; `optimus.scheduler.asserts=true`; `failEvery=7`; 16 clients on `gthread.ideal=2`; depth 8 (21 M nodes); `gthread.ideal=1` with 12 clients; `ideal=3` with failures. Loom mode runs but is not meaningful: `vt_helpers.sc` is missing from the export so the virtual-thread instrumentation is not applied, and `-ea` aborts in premain.
+
+Build-related foot-guns found on the way: `-ea` does nothing in the scheduler core (no Java `assert`s; everything is behind `optimus.scheduler.asserts`, read once into a `static final`); "Cannot patch core classes" and "Native Method Prefix not supported" are printed because the ext jar is absent, so `System.exit` and exception-constructor hooks are inactive; `gthread.ideal=-1` resolves to all cores with a floor of 4.
+
+## Tier 0 probe results
+
+Probes live in the scratchpad `probes/` directory (`run.sh` compiles and runs them against the build above; `Steps.java` is the schedule-driven step harness, `Probes.java` the cases). See TEST_CAMPAIGN.md for the design.
+
+| Probe | Hazard | Outcome | What was observed |
+|-------|--------|---------|-------------------|
+| W1a | [R2](#r2) reset at `MAX_VALUE` | not reproduced | Queue primed at `top = base = MAX-3`; three pushes trigger `resetBounds`, giving `top=63 base=60`; a steal and a fourth push then pop back every task; final state empty and consistent. The reset itself is sound. |
+| W1a' | [R2](#r2) "base overrun" | not reproduced | 20,000 single-element pop-vs-steal races never produced `base > top`. The class comment's "+1 overrun" state comes from an older `localPop` that did not CAS; the current one does. [R2](#r2) case 1 withdrawn (see amended [R2](#r2) above). |
+| W1b | [R2](#r2) marker after reset | **demonstrated** | Marker captured at `top = MAX-1`, one push fires the reset, five more pushes land; `localPop(marker)` returns null instead of the newest task. The owner cannot drain its own queue for the rest of that sync frame. |
+| W1f | [F8](#f8) retention | **demonstrated** | `[Done, Done, Live, Done]` after `localCleanup(null)` is `[Done, Done, Live]`: cleanup stops at the first live task and keeps the done ones beneath it. |
+| W1s | [R2](#r2) loss across wrap | not reproduced | 200 rounds × 2,000 pushes starting 50 below `MAX_VALUE`, owner popping every fourth, three thieves: every task observed at least once, queue empty at the end. |
+| W3d | [R1](#r1) id packing | **demonstrated** | `setCausality(1, 32768)` reads back as -32768; 65536 reads back as 0, 65537 as 1. `canTake(task stamped by thread 65537, thread 1, causality 1)` is `true` (aliasing lets thread 1 take another thread's sync-stack work) and `canTake(task stamped by 32768, thread 32768, causality 1)` is `false` (owner cannot take its own). `poisonCausality` extracts as thread -1. |
+| W2a | [R3](#r3) iteration vs removal | **demonstrated** | With the step harness forcing `tryRemove(a)` between the iterator's first and second element, `foreach` visits `[a, b]` and never visits the live item `c`, which `tryRemove` moved into the slot already passed. |
+| W5a | [F2](#f2) CME in callbacks | **demonstrated** | Three self-removing listeners; `runOnStalledCallbacks` throws `ConcurrentModificationException` from the `checkForNewWork` loop. Two listeners do not trigger it because the iterator never calls `next()` after the modification, so the window is size-dependent. |
+| W1g | growArray with sync marker | not reproduced | With `currentCausalityID = 1`, `growArray` keeps `nullTask` placeholders and a marker taken before the grow still fences exactly the post-marker tasks. With causality 0 the dones are dropped (positions shift) but no sync frame exists then, so no marker is live. Works as designed. |
+| W2b | [R3](#r3) iteration vs grow | **demonstrated** | `foreach` holds the pre-grow array: 4 of 8 items visited after a concurrent `add` doubled the array. Benign for cycle detection (new tracked nodes are checked next stall), misleading for the status dump. |
+| W2c | `tryStealing` count race | not reproduced | 4.8 M `tryStealing` calls against a thread adding/popping `Contexts` entries: no exception. The `Math.min(count, length)` guard and null check hold. |
+| W3a | waiter add vs complete | not reproduced | 2,000 rounds × 4 racing `continueWith` against `complete`: every waiter called exactly once. The `_waiters` CAS protocol is sound as far as a race without delay injection can show. |
+| W3b | `continueWithLast` ordering | not reproduced | `[second, first, last, last2]`: LIFO for `continueWith`, FIFO at the tail for `continueWithLast`, as documented. |
+| W3c | [F1](#f1) double completion | **demonstrated, differently** | Two racing `complete()` calls were detected ("Cannot complete node twice") but the child JVM exited 0. `InfoDumper.<clinit>` threw here (it reads an internal `utils.conf`), the exception escaped `logAndDie`, `complete()`'s `catch (Throwable)` re-entered `logAndDie`, and the static `inLogAndDie` guard returned silently. The process continued with a double-completed node. See new [F1b](#f1b). The `tryCompleteWithException` vs `complete` variant did not race into double completion in this run. |
+| W3e | [R6](#r6) stale waiter after invalidate | **demonstrated** | `invalidateCache` on an in-flight node: `isDoneEx()` becomes true, the registered waiter is not called and its `waitingOn` still points at the node; a later `complete()` then calls it. |
+| W3f | [F7](#f7) asserts off | **demonstrated** | `markAsRunnable` on a done node is silently ignored with `schedulerAsserts=false`. |
+| W3g | `tryRun` idempotence | not reproduced | 20,000 racing `tryRun` pairs: exactly one winner every time. |
+| W4a | [R6](#r6) frame reuse | **demonstrated** | `push(A)`, register the frame as A's waiter, `pop()`, `push(B)`: the same `SyncFrame` object comes back with `waitingOn == A`. |
+| W4b | visit during pop | not reproduced | Visitor sees the popped frame's node as null and continues; the production visitor null-checks. |
+| W5b | re-add during callback | not reproduced | Pending-list re-add works: one call per pass, listener still registered. |
+| W5c | priority gating | not reproduced | `[0, 0, 1]` with the first adding work: both priority-0 listeners called, priority-1 deferred to the next pass. As documented. |
+| W5d | [I4](#i4) registration cost | **demonstrated** (mild) | 20,000 listeners: 2.2 µs per add, 1.0 µs per remove, linear in the registered count. Quadratic but small at this scale. |
+| W6a | wake of a non-waiter | not reproduced | `tryWakeupThread` on a working context returns false and leaves `awaitedTask` null. |
+| W6b | [F4](#f4) `asIfRunning` id 1 | not reproduced | A task enqueued through `asIfRunning` carries causality 0/0: nothing runs under that context, so its id is never stamped. [F4](#f4) downgraded to cosmetic. |
+| W6c | [F3](#f3) inject after shutdown | **demonstrated** | After `shutdown()`, `enqueue` spawned two worker threads for one task; they exit instead of parking once done. |
+| W6d | spinner invariant | not reproduced | 1,200 checkpoints across enter/exit/enqueue transitions: `_spinningThreadID` always names a context in `_workers`, or is 0. |
+| W6e | [I3](#i3) thread start under lock | not reproduced (quantified) | `enqueue()` holding `_lock`: median 28 µs when it must create a platform thread vs 12.5 µs when it unparks an idle one, on this Mac. Real but smaller than I guessed; [I3](#i3) downgraded. |
+| W7 | [I1](#i1) wait entry cost | quantified | Median cross-thread blocking wait 29 µs; the unconditional `toString` + `new Exception` cost 0.25 µs on this trivial node with a shallow stack. Negligible here; only matters for nodes with expensive pretty-printing or deep stacks. [I1](#i1) downgraded. |
+
+The three remaining `WorkQueue` probes ran with the P3 delay-injection agent (`probes/src/probes/DelayAgent.java`, an ASM load-time transformer that inserts `probes.Delay.point(id)` after the slot reads and before the CAS/swap/removeAt in `tryToSteal`, `localPop`, `tryLocalPop`, `growArray` and `scanToFindWork`; the step harness then drives those points, so every interleaving of two threads × two steps is enumerated against the real class):
+
+| Probe | Hazard | Outcome | What was observed |
+|-------|--------|---------|-------------------|
+| W1c | pop vs steal, one element | **demonstrated** (stale return, no loss) | Schedule `A1 B1 B2 A2`: the thief takes T1 and bumps `_base`; the owner's CAS fails but `localPop` still returns T1 and leaves `_top` undecremented. Final `top=11 base=11`, consistent. The task is handed out twice; only the `tryRun` CAS prevents a double run. |
+| W1d | grow vs steal | not reproduced (resurrection noted) | No task dropped in any of the 6 schedules and `_base` after the swap is never below what the thief read. But in 3 schedules the thief steals T0 from the old array after the copy loop has already copied it, and the swap then writes `_base = 0`: the stolen task is live again at the bottom of the new array (double dispatch). The class comment allows this; anything that reads `size()` as a count of pending work (`checkNewWorkAdded`, `hasEnoughWork`) sees a phantom. |
+| W1e | scan vs steal | **demonstrated** (double hand-out, no loss, no hole) | Thread 7, causality 2, one matching task M at the steal end: in 4 of 6 schedules `scanToFindWork` returns M and `tryToSteal` also returns M. `removeAt` sees `index < _base` and does nothing, but `scanToFindWork` returns its earlier unsynchronised read anyway. Final `top=13 base=11`, `[T1, T2]` left. With M in the middle every schedule is clean. |
+
+## Tier 1 probe results
+
+End-to-end runs of the real scheduler in child JVMs, `probes/run-tier1.sh` (about five minutes; per-child logs with `TIER1_LOGDIR`). Summary and raw output in `probes/RESULTS-tier1.txt`.
+
+| Probe | Hazard | Outcome | What was observed |
+|-------|--------|---------|-------------------|
+| T1 | [R1](#r1) | **demonstrated: permanent hang** | Details under [R1](#r1). Refused re-enqueues 100% at ids ≥ 32,768; "fan" shape deadlocks with runnable work on the global queue and all threads waiting; `ideal=1` every run, `ideal=2`/4 clients 1–3 of 3. At 65,536 one client does not hang because the id aliases to 0, which `canTake` treats as unowned. |
+| T2 | [R2](#r2) | **demonstrated** | Details under [R2](#r2). Owner fenced off its own queue after the reset; hang at `ideal=1`, thief-carried at `ideal=2`. |
+| T7 | [F1](#f1)/[F1b](#f1b) | **demonstrated** (exit 0, not 121) | Node completes then throws → "Cannot complete node twice" → `logAndDie` → `InfoDumper.<clinit>` throws → recursion guard returns → JVM continues with `inLogAndDie = true`. A later unrelated double completion produces one "called recursively" line, no dump, no exit. |
+| T8 | [F2](#f2)/[F2b](#f2b) | **demonstrated** (hang, not exit 66) | 2–3 self-removing listeners: CME on the spinning worker → `panic` → `InfoDumper` throws → worker thread dies but stays in `_workers` → client parks until the watchdog. One self-remover: no CME, completes. |
+
+The remaining Tier 1 probes (`probes/run-tier1b.sh`, results in `probes/RESULTS-tier1b.txt`):
+
+| Probe | Hazard | Outcome | What was observed |
+|-------|--------|---------|-------------------|
+| T3 | [R3](#r3) | quantified | 15,791 stall passes over `_evalAsyncTrackedNodes` against 15.8 M adds and 7.4 M removals from non-graph threads: no exception (`foreach` stops at the first null, so it cannot throw), but marker nodes present for a whole pass went unvisited in 1.7% of checks, 28% with a 0–50 µs park per element, 0.2% at `ideal=2`. Benign for cycle detection today. |
+| T4 | [R4](#r4) | **demonstrated: deadlock** | Details under [R4](#r4). Both clients reported by `findDeadlockedThreads` on the first cross-scheduler recovery. |
+| T5 | [R5](#r5) | quantified | The wait always returns once the node stops, even under `-Xcomp -XX:-UseOnStackReplacement` (`Thread.yield` keeps the read from being hoisted). Cost is the waiter's CPU for the whole wait: 1.0–1.6 s of a 2.0 s wait on a busy node, 1.9–2.0 s with a 100,000-node forward chain, where each `visitForwardChain().containsEQ` poll costs 3–4.6 ms. |
+| T6 | [R6](#r6) | mechanism demonstrated, no functional effect | `invalidateCache` alone does not release the waiting thread; any later global enqueue does, leaving the `SyncFrame` on A's waiter list. The next sync wait reuses the frame; A's late completion clears the reused frame's `waitingOn` (B → null) while the thread still waits on B. The thread is not woken early and B's wait completes normally; the scheduler never reads `frame.waitingOn`, so the clobbering is invisible today. Stays L. |
+| T9 | [F3](#f3), [F3b](#f3b) | **demonstrated** | Details under [F3](#f3) and [F3b](#f3b). 10,001 live threads; at the OS limit a phantom worker that disables stall callbacks. |
+| T10 | [F4](#f4) | not reproduced ([F4](#f4) refuted, [R9](#r9) widened) | Nodes enqueued via `asIfRunning` carry stamp 0/0 and are stamped by whichever thread runs them. The deadlock the probe did find is identical with a fresh id, so it is the unstamped-delivery form of [R9](#r9), not the id collision. |
+| T11 | [I1](#i1) | quantified | Median blocking `get` 3.1 µs (cheap node, shallow stack) to 7.5 µs (20-arg node, stack depth 205). `toString` 0.13–0.5 µs; `new Exception` 0.29 µs at depth 5, 2.75–3.25 µs at depth 205. Together 13% of the fastest wait, 42–44% at depth 205; 1–6% once the client really parks (50 µs handoff). |
+| T12 | [I2](#i2) | quantified | `ideal=4`, one 5 s busy node: the spinner used 4.17 CPU-s (median 91% per 100 ms sample) when a client thread runs the node, 3.31 CPU-s (median 68%) when a worker runs it. |
+
+One more observation from T1 worth its own line: with `limitThreads` (the default), a thread moving to `_waiters` does not wake an idle worker (`nextStepForWorkingThread` only does `drainTo` + `addWorkerIfNeeded` under `!limitThreads`), and `addWorkerIfNeeded` counts waiters against the ideal. The design relies on waiting threads finding global work themselves via `canTake`; anything that makes `canTake` lie (R1) therefore leaves runnable work on the global queue with parked idle threads next to it. A periodic "runnable work on the global queue and no worker" check in `fullWait`'s timer branch would turn this class of deadlock into a stall.
+
+## Model checking results (H1, H2)
+
+jcstress and Lincheck under `probes/modelcheck/` (`./fetch.sh && ./build.sh`, then `./run.sh jcstress quick|default`, `./run.sh lincheck`, `./run.sh h2e`). The forked jcstress VMs carry the entity agent, so the tests run against the agent-rewritten `NodeTask`. Full outcome tables in `probes/modelcheck/RESULTS-modelcheck.txt`.
+
+| Test | Outcomes observed | Verdict |
+|------|-------------------|---------|
+| H1 pop vs steal | owner only 84%, thief only 16%, both 0.26% with `top == base` after | no loss |
+| H1 grow vs steal | clean 99.8%; stolen T0 resurrected in the new array 0.19% | no loss |
+| H1 scan vs steal (match at base) | thief got M 28%, scan got M and thief another 70%, M handed out twice 2.1% | no hole, no loss |
+| H1 scan vs steal (match mid) | one outcome | clean |
+| H1 push/pop vs two thieves across `MAX_VALUE` (tight variant) | handed out twice across `resetBounds` 0.02%; never lost, `size()` never negative, `isEmpty()` never lies | reset is sound |
+| H2a `tryAddToWaiterList` vs `complete` | (true, notified once) 50%, (false, caller notifies) 50% | contract holds |
+| H2b two `continueWith` vs `complete` | every waiter called once in 3.9 G samples | holds |
+| H2c `continueWithLast` ordering | 13 orders seen, the Last waiter always after every earlier non-Last waiter | holds |
+| H2d `tryRun` vs `tryRun` | exactly one winner | holds |
+| **H2e `markAsRunnable` vs `complete`** | **forbidden outcome in 2.0–2.4% of samples: `DONE_FLAG` set and `NOT_RUNNABLE` clear** | **fails, new [R8](#r8)** |
+| H2e' `tryMarkAsRunnable` vs `complete` (control) | done and not runnable, 100% | holds |
+
+Lincheck model checking of `WorkQueue` (owner push/pop/scan on one thread, thieves on others; array of 4, of 64, and a wrap variant starting at `MAX_VALUE - 5`; 1.5 M executions per config) passed against an at-least-once deque spec; 2.6–2.9% of executions only linearise if a task was handed out twice. A strict exactly-once spec fails at once with the R7 traces, which confirms the checker sees the real behaviour. Lincheck cannot instrument `NodeTask` (the entity agent adds fields to `TPDMask` at load time that Lincheck's class reader does not see), so H2 is jcstress only. Two deviations from the plan: the wrap test keeps push and pop on one actor because `_top` is owner-only by contract; H2c reaches the private `tryAddToWaiterListLast` through a method handle.
+
+<a id="r8"></a>
+### R8 (M) `markAsRunnable` racing `complete` leaves a completed node runnable
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Thread A<br/>child completed → parent.onChildCompleted
+    participant P as parent _state
+    participant B as Thread B<br/>completes parent (cancel / cycle recovery / tryComplete…)
+    A->>P: markAsRunnable: isDoneOrRunnable()? → false (state STARTED|NOT_RUNNABLE)
+    B->>P: complete(): tryUpdateState(DONE)  → STARTED|NOT_RUNNABLE|DONE_FLAG
+    A->>P: updateState(0, NOT_RUNNABLE)  (unconditional CAS loop) → STARTED|DONE_FLAG
+    Note over P: isDone() false, isDoneEx() true, isRunnable() true
+    A->>P: eq.enqueue(parent), later tryRun() wins → run() executes a second time
+    P->>P: second completion → "Cannot complete node twice!" → logAndDie
+```
+
+Found by H2e. `markAsRunnable` (NodeTask.java:762) is check-then-act: `if (!isDoneOrRunnable()) updateState(0, STATE_NOT_RUNNABLE)`, and `updateState` is an unconditional CAS loop. If `complete()` lands between the check and the CAS, the node ends in state `STARTED | DONE_FLAG` with `NOT_RUNNABLE` clear: `isDone()` is false, `isDoneEx()` is true, `isRunnable()` is true. The default `onChildCompleted` then enqueues it, `tryRun` wins, and `run()` executes a second time on a node that already has a result; its second completion goes to `logAndDie` (exit 121 in production, the F1b swallow here). Replayed deterministically by `./run.sh h2e`. `tryMarkAsRunnable` already does this right by re-checking `DONE` inside the CAS loop (`tryUpdateState`); `markAsRunnable` should use the same. Reachability needs a node that is waiting on a child to be completed by a third party while the child completes: cycle recovery (`detectCyclesAndRecover` completes a node mid-chain and its comment acknowledges the child's later completion re-enqueues it), cancellation, `tryCompleteWithException` from a non-graph thread, or `markAsRunnableAndEnqueue` racing a completion. Not yet reproduced end to end.
+
+## Fuzzer results (H3, H5)
+
+`probes/run-hunter.sh sweep 1 50` (seeded random DAGs: sync, fan-in, sequential re-enqueue, mixed, async roots launched from non-graph threads, promise-style completion from non-graph threads, failing leaves, nested cancellation; 1–6 clients; 14 configurations of `gthread.ideal` × asserts × delay injection × `limitThreads`). A second agent inside `Hunter.java` adds delay points at the scheduler's `parked`/`awaitedTask`/`_spinningThreadID` writes, around park/unpark, at the waiter-list read/notify and at `runAndWait` register/wait, so the whole wait protocol is perturbed, not only the deque. Full triage, dumps and reproduction commands in `probes/RESULTS-hunter.txt`.
+
+Coverage of the final sweep: 632 child runs, 94 k graph iterations, 20.9 M enqueues, 1.17 M promise completions from non-graph threads, 605 k external launches, 412 k failing leaves, 44 k cancelled scopes.
+
+| Outcome | Runs | Note |
+|---------|------|------|
+| pass | 555 | every oracle clean: values, exactly-once completion, H5 accounting (no leaked contexts, spinner consistent, queues empty), no `GraphInInvalidState` under asserts |
+| hang: causality stall ([R10](#r10)) | 45 | all with `limitThreads=true`; the 32 `limitThreads=false` runs never hang |
+| hang: sync-stack inversion ([R9](#r9)) | 14 | seeds 14 and 48; 5/5 on rerun |
+| both | 5 | |
+| pass, slow | 13 | a 1 s stall that the deadlock timer recovered ([R10](#r10) with the work on a forward chain) |
+
+No lost wakeup (the H3 target) was found: in the handful of cases where the deadlock timer saw the awaited node already done, `parked` cleared within 20 ms, so the wakeup was in flight. No failure matches R1–R8 or F1–F8, and no log shows the F1b/F2b kill-path artefact. One oracle hit (seed 20, a node not done) did not reproduce in 5 reruns and two further sweeps and stays open. Truncating the DAG as a minimiser worked poorly (BFS order drops the deep levels); hand-built scenarios serve as the minimal reproducers instead.
+
+<a id="r9"></a>
+### R9 (H) A stale causality stamp lets a thread run a task inside an unrelated sync frame and deadlock on its own stack
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant T as Thread T
+    participant Z as Node Z
+    participant X as non-graph thread
+    participant S as OGScheduler.enqueue
+    T->>T: runAndWait(R) → runAndWait(A) → runAndWait(Q): depth 2
+    T->>Z: Q enqueues Z, T runs Z in that frame: Z stamped (T, 2), Z registers on promise P1
+    T->>T: A and Q complete, frames pop, depth back to 1
+    T->>T: R: runAndWait(S), S: runAndWait(P2): T parks at depth 2 awaiting P2
+    X->>Z: P1.complete(scheduler) → Z.onChildCompleted → markAsRunnable
+    X->>S: enqueue(Z)
+    S->>S: waiter T: canTake(Z=(T,2), T, 2) → true (same thread, same depth, different frame)
+    S->>T: wakeupThread(Z): awaitedTask = Z, unpark
+    T->>Z: run Z inside the frame that is waiting on P2
+    Z->>T: Z's continuation: runAndWait(S)
+    Note over T: S is suspended two frames down on T's own stack.<br/>No waitingOn cycle. Nothing runnable. Permanent.
+```
+
+Found by the fuzzer (seeds 14, 48); deterministic 7-node reproducer `probes/run-hunter.sh inv i1-a0-d0-lt1`, which hangs at every `ideal` tried and with `limitThreads` either way. Causality ids are sync-stack *depths*, not frame identities (`OGSchedulerContext.runAndWait`, `currentCausalityID += 1`). A node stamped `(T, d)` by `run()` in a frame at depth `d` keeps that stamp after the frame has popped; `canTake` (OGScheduler.java:1096) then accepts it for any later, unrelated frame of `T` at depth ≤ `d`. The delivery path is a re-enqueue from a non-graph completion with the scheduler as the `EvaluationQueue` (what `NodePromise.complete` does): `OGScheduler.enqueue` scans the waiters, finds `T` parked at a compatible depth, and hands the task straight to it via `wakeupThread`. `T` runs it inside the unrelated frame; the task's continuation then `runAndWait`s a shared node `S` whose `run()` is a frame lower on `T`'s own stack. `T` parks on `S`, `S` can never return, and nothing wakes `T` (its `awaitedTask` is `S`). There is no cycle in the graph, so cycle detection finds nothing, and nothing is runnable, so the deadlock timer finds nothing. Permanent. Schedule of the reproducer: `T: runAndWait(R)`; `R: runAndWait(A)`; `A: runAndWait(Q)`; `Q` enqueues `Z`, which runs in that frame (stamp `T/2`) and registers on promise `P1`; `A` and `Q` pop; `R: runAndWait(S)`; `S: runAndWait(P2)`, so `T` parks at depth 2; `P1` completes from another thread; `Z` is handed to `T` and runs `runAndWait(S)`. Fix direction: stamp a per-frame identity (a monotonic frame id, or depth plus a per-thread epoch bumped on every pop) and compare that in `canTake`; or have `enqueue` refuse to hand a task to a waiter whose sync stack contains a node on the task's forward chain. Not R1 (ids are exact here) and not R6 (frames are fresh).
+
+Tier 1 probe T10 shows the same delivery path needs no stale stamp at all: a never-stamped node (`0/0`, which `canTake` treats as "anyone may take") enqueued from outside is handed by `enqueue`'s waiter scan to a thread parked under a sync stack; that thread runs it, and if its continuation sync-waits on a node lower on that thread's stack, the result is the same permanent deadlock. The stamp only governs *which* waiter gets the task; the invariant that matters (the task's transitive dependencies must not include a node suspended on the taker's stack) is never checked. The second fix direction above addresses both.
+
+<a id="r10"></a>
+### R10 (H) Under `limitThreads`, global work that no waiter may take starves while idle workers stay parked
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    work: task K on global quick queue<br/>stamp poisoned (−1, 1) or another thread's
+    waiting: every graph thread in _waiters<br/>(all have sync stacks, depth ≥ 1)
+    idle: idle workers parked<br/>(causality 0, could run K)
+    hang: permanent hang
+
+    [*] --> work: evaluateNodeAsync / SEQ re-enqueue from non-graph thread
+    work --> waiting: enqueue - canTakeK, ctx, depth≥1 false for every waiter
+    waiting --> idle: addWorkerIfNeeded - workers + waiters ≥ ideal → no injection
+    idle --> hang: nothing re-checks the global queue on move-to-waiters / exitGraph, 1 s timer only walks forward chains
+    note right of hang
+        limitThreads=false never hangs:
+        a causality-0 spinner always exists.
+    end note
+```
+
+Found by the fuzzer (seeds 6, 21, 23, 28, 34, 39, 41, 42, 44, 48); deterministic 2-node reproducer `probes/run-hunter.sh inv n2:i1-a0-d0-lt1` (hangs at `ideal=1`, passes at `ideal ≥ 2`; the large seeds hang at `ideal=2` and `4` too). This is the mechanism noted after the Tier 1 table, now with organic triggers that need no primed state: work lands on the global quick queue with a stamp that `canTake` rejects for every current waiter, either the poisoned `(-1, 1)` stamp that `evaluateNodeAsync`/`poisonCausality` applies, or a sequential node re-enqueued from a non-graph thread still carrying another thread's stamp. Only a causality-0 thread could run it. With `limitThreads` (the default), `addWorkerIfNeeded` counts waiters against the ideal, so once waiters ≥ ideal no helper is added; the move to `_waiters` and `exitGraph` (when `_workers.count == 0`) never re-check the global queue; and a waiter that leaves (freeing a slot) does not either. If the task is on some waiter's forward chain the 1 s timer recovers it (the 13 "pass, slow" runs); otherwise the hang is permanent, with runnable work in the dump next to parked idle threads. The `limitThreads=false` configurations never hang because a causality-0 spinner always exists there. Fix direction: when a thread moves to `_waiters` or exits, and in the timer branch of `fullWait`, check for runnable global work that no current waiter can take and inject or unpark a causality-0 worker for it, even above the ideal count.
+
+<a id="r10b"></a>
+### R10b (H at `ideal=1`) The last thread leaves the graph with runnable work still queued
+
+Found by the cancellation fuzzing (H6, seeds 12, 13, 15, 16, 19, 28, 30; `HUNTER_OPTS=-Dhunter.h6=true probes/run-hunter.sh one 13 i1-a1-d0-lt1 0 3` fails 3 of 3). Work is enqueued onto the global quick queue while the only slot is busy; the last thread then exits through `exitGraph` (OGScheduler.java:694), which calls `addWorkerIfNeeded` only when `isExternallyBlocked || _workers.count > 0`. With the count now 0 nobody is injected, and the accounting oracle finds `workers=0, waiters=0`, four runnable tasks on `_qqueue`, four tracked nodes, and `schedulerInBadState()` true. The tracked-node fallback (`scheduleTrackedWorkIfNeeded`) only runs from `nextStepForWorkingThread`, not from `exitGraph`. Same family as R10: the global queue is not re-checked on the transitions that empty the pool. Fix: in `exitGraph`, when `_workers.count` reaches 0, inject a worker if either queue holds a runnable task or tracked nodes remain.
+
+<a id="r11"></a>
+### R11 (M) `waitForCancelledNodesToStop` called from inside the graph can spin forever
+
+Found by H6 (seed 25 at `ideal=4` with asserts, 2 of 12 runs). The snapshot in `waitForCancelledNodesToStop` (OGScheduler.java:1627) captures a cancelled node that was *running* at that moment, with its context as the frame rather than a `SyncFrame`. The OPTIMUS-43488 self-deadlock guard in `waitForCancelledNodeToStop` only runs when the frame is a `SyncFrame`, so if that running node then sync-waits on something the caller must produce, the caller spins on `Thread.yield()` indefinitely and the node never stops. The guard needs to cover the context-frame case too, or the method must refuse to be called from a graph thread that holds a sync stack.
+
+Harness note (not a scheduler finding): a delay park inserted between `fullWait`'s `parked` check and its `parkNanos` consumed the waker's unpark permit and turned every such wakeup into a 1 s wait; that point now busy-spins. The latent production form is narrow: with `schedulerRecoveryInWait` on, anything on that iteration that parks through `java.util.concurrent` (stalled callbacks, stall logging) would do the same.
+
+## Fuzzer results, second round (H4, H6–H10)
+
+Commands and the full analysis are in `probes/RESULTS-hunter2.txt`; `Hunter.java` gained the H4 oracle, the H6/H7/H8 modes, `inv u:` and `soak`, and `run-hunter.sh` gained `HUNTER_LOOM=1`.
+
+**H4, causality oracle.** The agent now gives every sync frame a unique id and records who stamped and who took each task. Two checks: STALE_TAKE (the frame that stamped the task has popped) and SELF_WAIT (before a thread parks, and on each timer tick, walk the awaited node's dependencies; reaching a node suspended on the parking thread's own stack is a certain deadlock). SELF_WAIT fired on all 14 R9 hangs in the 50-seed sweep (13 before the park, 1 at the first tick), on `inv`, and on none of 567 passing runs or any passing H6/H7/H9 run. The 45 R10 hangs correctly got no SELF_WAIT. STALE_TAKE alone is not a predictor: it fired in 18 passing runs. The R9 shape cannot be seen at hand-out time, because the dependency that closes the loop does not exist yet; only the check before parking catches it, which is also where a production guard would have to live.
+
+**N4, the second way into R9.** Seed 14 reaches the R9 deadlock through a task with *no* stamp, as T10 found independently: `enqueue` hands a fresh node from a non-graph thread (`enqueueAndTrackCompletion` or plain `enqueue`; neither poisons) to a thread parked at depth d. `probes/run-hunter.sh inv u:<cfg>` reproduces it at `ideal` 1, 2 and 4, with `limitThreads` off, and under virtual threads. Folded into R9.
+
+**H6, cancellation at every lifecycle state.** 120 runs: 97 pass, 7 pass-slow, 7 oracle failures (all R10b), 9 hangs (R9 ×4, R10 ×4, R11 ×1). Every lifecycle state fired 643–2,379 times. External `waitForCancelledNodesToStop` never exceeded 2 s (max 9 ms, one 1,001 ms outlier) and never returned while the cancelled leaf still ran. Of sync waiters in a cancelled scope, 618 ended with the cancellation exception and 668 with a value (their awaited child had already started); all 500 whose child was cancelled got the exception; none hung. No double completion; the documented self-deadlock guard threw 15 times as designed.
+
+**H7, multi-scheduler.** 120 runs (2–4 schedulers × affinity on/off × `ideal` 2/4): 31 hangs, 21 on seeds that pass with one scheduler. 20 are R9, 10 are R10 (6 on the default scheduler, 4 on a secondary one), 1 is unexplained (seed 24, four schedulers). With affinity on, every node ran on the scheduler its scenario stack named; re-homing of nodes sync-awaited from another scheduler's thread drops 20–40× but not to zero. R4 was not reached: the fuzzer has no cycle recovery, so T4 remains its only reproducer.
+
+**H8, resource exhaustion.** `syncStackSafetyLimit` bumps causality where configured but does not reduce stack use (see F1). `proxyChainStackLimit=2` with a 5,000-node fan-in chain made 1,666 hand-offs through `delayOnChildCompleted`; at most one `DelayOnChildCompletedNode` was ever queued and nothing stalled, from either a graph or a non-graph completer; the sequential chain needs none. With the limit at -1 a 5,000-deep completion chain overflows the stack and ends in "logAndDie called recursively" (F1b) and a hang. F8 quantified: 1,000,000 completed priority-1 nodes stay on `_queue` while the graph thread is in the graph; ~997 k remain right after it exits at `ideal ≥ 2`; 0 after quiescence.
+
+**H9, virtual threads.** A loom-on agent loads once `vt_helpers.sc` is stubbed with a comment-only file (the real one is missing from the export; with `-ea` its absence aborts premain). Caveats: no entityagent-ext jar means no `.sc` instrumentation of JDK classes, and `synchronized` still pins carriers on JDK 21, so only the scheduler's own virtual-thread paths were exercised. Predictions held: R9 occurs (inv 8 of 11, `u:` 4 of 4, seeds 14 and 15 as with platform threads) and R10's reproducer never hangs (0 of 5). One rare new shape (seed 6, 1 of 6): unstamped runnable work on the global queue, three waiters, no worker and no virtual thread alive; R10 family. Throughput within 6% of platform threads.
+
+**H10, 60-minute soak** (two long-lived JVMs, `ideal` 2 and 4, delays on, `limitThreads` on, fresh seeds from 1,000, nothing primed): 2,145 seed results, about 1,206 pass; 129 hangs were recovered by injecting one causality-0 worker (the R10 fix direction) and 73 were not; 23 SELF_WAIT findings, each before the park. No drift: heap after GC 14–19 MB in every window, live workers ≤ 5, `_onStalledCallbacks` and `_queue` always 0. Wrap hazards measured, not reached: `threadCounter` +1–1.7/s, the busiest `_top` +415/s (R2 in about 60 days at that rate). Most runs classed as accounting failures were a harness artefact (clients abandoned after an R9 hang stay in `_waiters`). No new failure class.
+
+Still open: seed 20's `HASYNC#9` left not done with `pending=0`, now seen twice in about 1,000 runs.
+
+<a id="r7"></a>
+### R7 (L) Three paths return a task after the write that should have confirmed it was taken fails
+
+`localPop` (OGSchedulerContext.java:410–421) returns `r` even when its CAS failed; `scanToFindWork` (line 566 onward) returns `t` even when `removeAt` found `_base` already past it; `growArray` (line 466 onward) copies slots a thief is concurrently emptying and then resets `_base` below the thief's bump; Lincheck found the multi-step form, three steals overlapping one copy and the swap writing `_base = 1`, so two tasks come back and `size()` overstates pending work by the number of steals that overlapped the copy. All three are known to the authors ("tasks can be on more than one queue at a time") and are safe only because `OGSchedulerContext.run` CASes `STATE_NOT_RUNNABLE` before running. Worth stating that invariant as a comment on each site and asserting it under `schedulerAsserts` (a task returned twice must fail the second `tryRun`); and `size()` should not be used as a pending-work count anywhere that matters.
+
+<a id="f1b"></a>
+### F1b (M) A failed kill is swallowed, and the guard then disables every later kill
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant N as complete()
+    participant L as logAndDie<br/>(static inLogAndDie)
+    participant I as InfoDumper.graphPanic
+    N->>N: second completion detected: tryUpdateState saw DONE
+    N->>L: logAndDie(e)
+    L->>L: inLogAndDie = true, log, dump graph state
+    L->>I: graphPanic(…, 121, …)
+    I--xL: throws (here: <clinit> needs utils.conf, in prod: any crumb/dump failure)
+    L--xN: exception escapes logAndDie
+    N->>L: catch (Throwable) → logAndDie(e) again
+    L-->>N: inLogAndDie already true → "called recursively!" → return
+    Note over N: JVM continues with a double-completed node.<br/>inLogAndDie is never reset: every later logAndDie is a silent return.
+```
+
+Found by W3c. `NodeTask.logAndDie` (NodeTask.java:1291) sets a static `inLogAndDie = true`, logs, dumps graph state and calls `InfoDumper.graphPanic`, which is expected to `Runtime.exit`. If anything on that path throws (here `InfoDumper.<clinit>` failing on a missing config; in production a breadcrumb or dump failure would do), the exception leaves `logAndDie`, is caught by `complete()`'s `catch (Throwable)`, which calls `logAndDie` again, hits the guard, logs "called recursively" and returns. The node is left double-completed and the JVM keeps running. `inLogAndDie` is never reset, so from then on every `logAndDie` in the process is a silent return. The guard should only short-circuit re-entrancy on the same thread, and the fallback when the kill path itself fails should be `Runtime.halt`.

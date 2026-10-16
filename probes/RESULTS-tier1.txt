@@ -1,0 +1,244 @@
+Tier 1 probes T1, T2, T7, T8 (optimus.graph.Tier1). Command: probes/run-tier1.sh [T1 T2 T7 T8]  (TIER1_LOGDIR=<dir> keeps each child JVM's log)
+Every scenario runs in its own child JVM (static-final Settings). JDK 21, entity agent, loom-off build (limitThreads defaults to true). Full run: ~5 min.
+
+Summary
+- T1 (R1)  DEMONSTRATED. With threadCounter primed so client ids are >= 32768, every re-enqueue of an FSM-style node from a causality>0 frame
+           is refused by its own thread (canTake false: 100% of 9k-460k re-enqueues vs 0-1% at baseline) and goes to the global queue.
+           Shapes where all such nodes stay on the waiter's forward chain (sync, mixed, fsm2) still finish at baseline speed: the chain walk
+           in wait() hands them back. Shape "fan" (Sync -> CountFan registering on all children -> Fsm -> Sync) puts siblings off the chain:
+           permanent hang (>10 s, deadlock timer never recovers) with runnable Fsm nodes in the global quick queue, all clients in
+           waitThreads, workThreads empty, idle workers parked. ideal=1: 32768 and 65530 hang every time; 65536 with one client does not
+           (id aliases to 0, which canTake treats as "anyone may take"). ideal=2/4 clients: 1-3 of 3 runs hang. ideal=2/8 clients: no hang
+           in 4 runs per prime. No GraphInInvalidState under asserts; no slow-but-finishing runs (maxTree 13-28 ms everywhere).
+- T2 (R2)  DEMONSTRATED. localQ primed at MAX-10; sync frame captures marker=MAX-6; the fan-out's 6th push fires resetBounds -> top=257 base=53,
+           marker 2147483641 > top-1, owner fenced off its own 200 tasks. ideal=1: hang (1/800 leaves run, 20 s watchdog). ideal=2: completes
+           in 18 ms but the owner ran 1/800 leaves (baseline 200/800): a thief did all the work.
+- T7 (F1/F1b) DEMONSTRATED (exit 0, not 121). complete() then throw -> "Cannot complete node twice" -> logAndDie -> InfoDumper.<clinit> throws
+           ExceptionInInitializerError (ConfigException$Missing: main/internal/utils.conf, key 'eu-stack') -> complete()'s catch -> logAndDie
+           "called recursively" -> JVM continues; inLogAndDie stays true. A second, unrelated double completion afterwards logs only
+           "logAndDie called recursively!" (1 line, no graph dump, no exit): every later kill is a silent no-op.
+- T8 (F2)  DEMONSTRATED (hang, not exit 66). 2 or 3 self-removing listeners + 1 completer: CME from PriorityQueue$Itr.next in
+           runOnStalledCallbacks <- findWork <- spin <- OGLogicalThread.run on the spinning worker og.worker-1-3; panic(66) -> InfoDumper
+           ExceptionInInitializerError -> the worker thread dies but stays in _workers (status dump: workThreads 1 [og.worker-1-3],
+           waitThreads 1 [t8-client], 2 callbacks still registered); the client parks forever (20 s watchdog). The CME itself is never logged
+           (seen only via -Xlog:exceptions=info). 1 self-remover + completer: no CME (iterator never calls next() after the removal), completes.
+
+Raw output of the final run (Entity Agent banner lines removed):
+RESULT T2 DEMONSTRATED [ideal=1 none] exit=0 ms=14 ok=true queueAfterPush{top=204 base=0 size=204 marker=4 causality=1 ownerFenced=false} leavesByOwner=800/800; [ideal=1 primed] exit=3 ms=null ok=null queueAfterPush{top=257 base=53 size=204 marker=2147483641 causality=1 ownerFenced=true} leavesByOwner=1/800 HANG(20010ms, leavesRun=1); [ideal=2 none] exit=0 ms=16 ok=true queueAfterPush{top=204 base=2 size=202 marker=4 causality=1 ownerFenced=false} leavesByOwner=200/800; [ideal=2 primed] exit=0 ms=18 ok=true queueAfterPush{top=257 base=55 size=202 marker=2147483641 causality=1 ownerFenced=true} leavesByOwner=1/800; 
+RESULT T1 DEMONSTRATED 
+  [asserts=false ideal=2 clients=4 sync prime=none] hangs=0/1 selfRejected/reenqueued(cid>0)=0/0 ids=[2,3,4,5,6,7] runs: 151ms(maxTree 21)
+  [asserts=false ideal=2 clients=4 sync prime=32760] hangs=0/1 selfRejected/reenqueued(cid>0)=0/0 ids=[32760,32761,32762,32763,32764,32765] runs: 137ms(maxTree 21)
+  [asserts=false ideal=2 clients=4 sync prime=32768] hangs=0/1 selfRejected/reenqueued(cid>0)=0/0 ids=[32768,32769,32770,32771,32772,32773] runs: 134ms(maxTree 22)
+  [asserts=false ideal=2 clients=4 sync prime=65530] hangs=0/1 selfRejected/reenqueued(cid>0)=0/0 ids=[65530,65531,65532,65533,65534,65535] runs: 124ms(maxTree 19)
+  [asserts=false ideal=2 clients=4 sync prime=65536] hangs=0/1 selfRejected/reenqueued(cid>0)=0/0 ids=[65536,65537,65538,65539,65540,65541] runs: 134ms(maxTree 21)
+  [asserts=false ideal=2 clients=4 mixed prime=none] hangs=0/1 selfRejected/reenqueued(cid>0)=1042/54751 ids=[2,3,4,5,6,7] runs: 95ms(maxTree 21)
+  [asserts=false ideal=2 clients=4 mixed prime=32760] hangs=0/1 selfRejected/reenqueued(cid>0)=852/54691 ids=[32760,32761,32762,32763,32764,32765] runs: 100ms(maxTree 25)
+  [asserts=false ideal=2 clients=4 mixed prime=32768] hangs=0/1 selfRejected/reenqueued(cid>0)=54366/54366 ids=[32768,32769,32770,32771,32772] runs: 96ms(maxTree 21)
+  [asserts=false ideal=2 clients=4 mixed prime=65530] hangs=0/1 selfRejected/reenqueued(cid>0)=54503/54503 ids=[65530,65531,65532,65533,65534,65535] runs: 101ms(maxTree 22)
+  [asserts=false ideal=2 clients=4 mixed prime=65536] hangs=0/1 selfRejected/reenqueued(cid>0)=42023/54242 ids=[65536,65537,65538,65539,65540,65541] runs: 97ms(maxTree 21)
+  [asserts=false ideal=2 clients=4 fsm2 prime=none] hangs=0/1 selfRejected/reenqueued(cid>0)=1010/218781 ids=[2,3,4,5,6] runs: 99ms(maxTree 19)
+  [asserts=false ideal=2 clients=4 fsm2 prime=32760] hangs=0/1 selfRejected/reenqueued(cid>0)=962/219083 ids=[32760,32761,32762,32763,32764,32765] runs: 109ms(maxTree 23)
+  [asserts=false ideal=2 clients=4 fsm2 prime=32768] hangs=0/1 selfRejected/reenqueued(cid>0)=221155/221155 ids=[32768,32769,32770,32771,32772,32773] runs: 148ms(maxTree 23)
+  [asserts=false ideal=2 clients=4 fsm2 prime=65530] hangs=0/1 selfRejected/reenqueued(cid>0)=223166/223166 ids=[65530,65531,65532,65533,65534,65535] runs: 131ms(maxTree 23)
+  [asserts=false ideal=2 clients=4 fsm2 prime=65536] hangs=0/1 selfRejected/reenqueued(cid>0)=167176/221069 ids=[65536,65537,65538,65539,65540,65541] runs: 107ms(maxTree 24)
+  [asserts=false ideal=2 clients=4 fan prime=none] hangs=0/3 selfRejected/reenqueued(cid>0)=14/10047 ids=[2,3,4,5,6,7] runs: 83ms(maxTree 21) 86ms(maxTree 21) 90ms(maxTree 20)
+  [asserts=false ideal=2 clients=4 fan prime=32760] hangs=0/3 selfRejected/reenqueued(cid>0)=0/12740 ids=[32760,32761,32762,32763,32764,32765] runs: 84ms(maxTree 22) 97ms(maxTree 20) 79ms(maxTree 21)
+  [asserts=false ideal=2 clients=4 fan prime=32768] hangs=1/3 selfRejected/reenqueued(cid>0)=9202/9202 ids=[32768,32769,32770,32771,32772,32773] runs: HANG
+      | CHILD-HANG t1 not done; reenq=642 selfRejects=642 max tree so far 20 ms
+      | global quick queue  [
+      | optimus.graph.Tier1.Fsm:Si: [12 occurrences]
+      | workThreads []
+      | waitThreads 4 [
+      | idleThreads 2 [ 94ms(maxTree 20) 87ms(maxTree 21)
+  [asserts=false ideal=2 clients=4 fan prime=65530] hangs=1/3 selfRejected/reenqueued(cid>0)=9066/9066 ids=[65530,65531,65532,65533,65534,65535] runs: 95ms(maxTree 20) 97ms(maxTree 21) HANG
+      | CHILD-HANG t1 not done; reenq=1771 selfRejects=1771 max tree so far 20 ms
+      | global quick queue  [
+      | optimus.graph.Tier1.Fsm:Si: [12 occurrences]
+      | workThreads []
+      | waitThreads 4 [
+      | idleThreads 2 [
+  [asserts=false ideal=2 clients=4 fan prime=65536] hangs=2/3 selfRejected/reenqueued(cid>0)=6312/9009 ids=[65536,65537,65538,65539,65540,65541] runs: 98ms(maxTree 20) HANG
+      | CHILD-HANG t1 not done; reenq=3940 selfRejects=849 max tree so far 20 ms
+      | global quick queue  [
+      | optimus.graph.Tier1.Fsm:Si: [9 occurrences]
+      | workThreads []
+      | waitThreads 3 [
+      | idleThreads 1 [ HANG
+  [asserts=false ideal=2 clients=8 fan prime=none] hangs=0/2 selfRejected/reenqueued(cid>0)=16/22813 ids=[2,3,4,5,6,7,8,9,10,11] runs: 133ms(maxTree 23) 130ms(maxTree 22)
+  [asserts=false ideal=2 clients=8 fan prime=32760] hangs=0/2 selfRejected/reenqueued(cid>0)=16/22950 ids=[32760,32761,32762,32763,32764,32765,32766,32767,32768,32769] runs: 144ms(maxTree 24) 138ms(maxTree 23)
+  [asserts=false ideal=2 clients=8 fan prime=32768] hangs=0/2 selfRejected/reenqueued(cid>0)=21947/21947 ids=[32768,32769,32770,32771,32772,32773,32774,32775,32776] runs: 139ms(maxTree 19) 142ms(maxTree 22)
+  [asserts=false ideal=2 clients=8 fan prime=65530] hangs=0/2 selfRejected/reenqueued(cid>0)=18779/21822 ids=[65530,65531,65532,65533,65534,65535,65536,65537,65538,65539] runs: 145ms(maxTree 24) 143ms(maxTree 25)
+  [asserts=false ideal=2 clients=8 fan prime=65536] hangs=0/2 selfRejected/reenqueued(cid>0)=18618/21633 ids=[65536,65537,65538,65539,65540,65541,65542,65543,65544,65545] runs: 146ms(maxTree 24) 146ms(maxTree 23)
+  [asserts=false ideal=1 clients=1 fan prime=none] hangs=0/1 selfRejected/reenqueued(cid>0)=0/3200 ids=[2] runs: 39ms(maxTree 16)
+  [asserts=false ideal=1 clients=1 fan prime=32760] hangs=0/1 selfRejected/reenqueued(cid>0)=0/3200 ids=[32760] runs: 38ms(maxTree 15)
+  [asserts=false ideal=1 clients=1 fan prime=32768] hangs=1/1 selfRejected/reenqueued(cid>0)=null ids=null runs: HANG
+      | CHILD-HANG t1 not done; reenq=4 selfRejects=4 max tree so far 0 ms
+      | global quick queue  [
+      | optimus.graph.Tier1.Fsm:Si: [3 occurrences]
+      | workThreads []
+      | waitThreads 1 [
+      | idleThreads []
+  [asserts=false ideal=1 clients=1 fan prime=65530] hangs=1/1 selfRejected/reenqueued(cid>0)=null ids=null runs: HANG
+      | CHILD-HANG t1 not done; reenq=4 selfRejects=4 max tree so far 0 ms
+      | global quick queue  [
+      | optimus.graph.Tier1.Fsm:Si: [3 occurrences]
+      | workThreads []
+      | waitThreads 1 [
+      | idleThreads []
+  [asserts=false ideal=1 clients=1 fan prime=65536] hangs=0/1 selfRejected/reenqueued(cid>0)=0/3200 ids=[65536] runs: 37ms(maxTree 14)
+  [asserts=false ideal=1 clients=4 fan prime=none] hangs=0/1 selfRejected/reenqueued(cid>0)=0/12800 ids=[2,3,4,5] runs: 73ms(maxTree 18)
+  [asserts=false ideal=1 clients=4 fan prime=32760] hangs=0/1 selfRejected/reenqueued(cid>0)=0/12800 ids=[32760,32761,32762,32763] runs: 69ms(maxTree 20)
+  [asserts=false ideal=1 clients=4 fan prime=32768] hangs=1/1 selfRejected/reenqueued(cid>0)=null ids=null runs: HANG
+      | CHILD-HANG t1 not done; reenq=16 selfRejects=16 max tree so far 0 ms
+      | global quick queue  [
+      | optimus.graph.Tier1.Fsm:Si: [12 occurrences]
+      | workThreads []
+      | waitThreads 4 [
+      | idleThreads []
+  [asserts=false ideal=1 clients=4 fan prime=65530] hangs=1/1 selfRejected/reenqueued(cid>0)=null ids=null runs: HANG
+      | CHILD-HANG t1 not done; reenq=16 selfRejects=16 max tree so far 0 ms
+      | global quick queue  [
+      | optimus.graph.Tier1.Fsm:Si: [12 occurrences]
+      | workThreads []
+      | waitThreads 4 [
+      | idleThreads []
+  [asserts=false ideal=1 clients=4 fan prime=65536] hangs=1/1 selfRejected/reenqueued(cid>0)=null ids=null runs: HANG
+      | CHILD-HANG t1 not done; reenq=3212 selfRejects=12 max tree so far 20 ms
+      | global quick queue  [
+      | optimus.graph.Tier1.Fsm:Si: [9 occurrences]
+      | workThreads []
+      | waitThreads 3 [
+      | idleThreads []
+  [asserts=true ideal=2 clients=4 sync prime=none] hangs=0/1 selfRejected/reenqueued(cid>0)=0/0 ids=[2,3,4,5,6,7] runs: 146ms(maxTree 22)
+  [asserts=true ideal=2 clients=4 sync prime=32760] hangs=0/1 selfRejected/reenqueued(cid>0)=0/0 ids=[32760,32761,32762,32763,32764,32765] runs: 139ms(maxTree 21)
+  [asserts=true ideal=2 clients=4 sync prime=32768] hangs=0/1 selfRejected/reenqueued(cid>0)=0/0 ids=[32768,32769,32770,32771,32772,32773] runs: 132ms(maxTree 21)
+  [asserts=true ideal=2 clients=4 sync prime=65530] hangs=0/1 selfRejected/reenqueued(cid>0)=0/0 ids=[65530,65531,65532,65533,65534,65535] runs: 126ms(maxTree 22)
+  [asserts=true ideal=2 clients=4 sync prime=65536] hangs=0/1 selfRejected/reenqueued(cid>0)=0/0 ids=[65536,65537,65538,65539,65540,65541] runs: 132ms(maxTree 22)
+  [asserts=true ideal=2 clients=4 mixed prime=none] hangs=0/1 selfRejected/reenqueued(cid>0)=1022/54692 ids=[2,3,4,5,6,7] runs: 105ms(maxTree 22)
+  [asserts=true ideal=2 clients=4 mixed prime=32760] hangs=0/1 selfRejected/reenqueued(cid>0)=1098/54777 ids=[32760,32761,32762,32763,32764,32765] runs: 97ms(maxTree 23)
+  [asserts=true ideal=2 clients=4 mixed prime=32768] hangs=0/1 selfRejected/reenqueued(cid>0)=54463/54463 ids=[32768,32769,32770,32771,32772] runs: 94ms(maxTree 27)
+  [asserts=true ideal=2 clients=4 mixed prime=65530] hangs=0/1 selfRejected/reenqueued(cid>0)=54496/54496 ids=[65530,65531,65532,65533,65534] runs: 87ms(maxTree 20)
+  [asserts=true ideal=2 clients=4 mixed prime=65536] hangs=0/1 selfRejected/reenqueued(cid>0)=42105/54527 ids=[65536,65537,65538,65539,65540,65541] runs: 95ms(maxTree 24)
+  [asserts=true ideal=2 clients=4 fsm2 prime=none] hangs=0/1 selfRejected/reenqueued(cid>0)=333/220062 ids=[2,3,4,5,6] runs: 101ms(maxTree 22)
+  [asserts=true ideal=2 clients=4 fsm2 prime=32760] hangs=0/1 selfRejected/reenqueued(cid>0)=986/218975 ids=[32760,32761,32762,32763,32764,32765] runs: 123ms(maxTree 23)
+  [asserts=true ideal=2 clients=4 fsm2 prime=32768] hangs=0/1 selfRejected/reenqueued(cid>0)=222202/222202 ids=[32768,32769,32770,32771,32772] runs: 134ms(maxTree 26)
+  [asserts=true ideal=2 clients=4 fsm2 prime=65530] hangs=0/1 selfRejected/reenqueued(cid>0)=222218/222218 ids=[65530,65531,65532,65533,65534] runs: 137ms(maxTree 23)
+  [asserts=true ideal=2 clients=4 fsm2 prime=65536] hangs=0/1 selfRejected/reenqueued(cid>0)=170492/224747 ids=[65536,65537,65538,65539,65540] runs: 131ms(maxTree 21)
+  [asserts=true ideal=2 clients=4 fan prime=none] hangs=0/3 selfRejected/reenqueued(cid>0)=21/10068 ids=[2,3,4,5,6,7] runs: 104ms(maxTree 22) 88ms(maxTree 20) 90ms(maxTree 20)
+  [asserts=true ideal=2 clients=4 fan prime=32760] hangs=0/3 selfRejected/reenqueued(cid>0)=14/9964 ids=[32760,32761,32762,32763,32764,32765] runs: 99ms(maxTree 21) 87ms(maxTree 21) 82ms(maxTree 21)
+  [asserts=true ideal=2 clients=4 fan prime=32768] hangs=1/3 selfRejected/reenqueued(cid>0)=9190/9190 ids=[32768,32769,32770,32771,32772,32773] runs: 98ms(maxTree 20) 90ms(maxTree 21) HANG
+      | CHILD-HANG t1 not done; reenq=1483 selfRejects=1483 max tree so far 21 ms
+      | global quick queue  [
+      | optimus.graph.Tier1.Fsm:Siq: [12 occurrences]
+      | workThreads []
+      | waitThreads 4 [
+      | idleThreads 2 [
+  [asserts=true ideal=2 clients=4 fan prime=65530] hangs=0/3 selfRejected/reenqueued(cid>0)=9195/9195 ids=[65530,65531,65532,65533,65534,65535] runs: 100ms(maxTree 19) 98ms(maxTree 18) 106ms(maxTree 20)
+  [asserts=true ideal=2 clients=4 fan prime=65536] hangs=1/3 selfRejected/reenqueued(cid>0)=6327/9013 ids=[65536,65537,65538,65539,65540,65541] runs: 96ms(maxTree 20) HANG
+      | CHILD-HANG t1 not done; reenq=8825 selfRejects=6081 max tree so far 22 ms
+      | global quick queue  [
+      | optimus.graph.Tier1.Fsm:Siq: [9 occurrences]
+      | workThreads []
+      | waitThreads 3 [
+      | idleThreads 1 [ 104ms(maxTree 21)
+  [asserts=true ideal=2 clients=8 fan prime=none] hangs=0/2 selfRejected/reenqueued(cid>0)=60/21238 ids=[2,3,4,5,6,7,8,9,10,11] runs: 148ms(maxTree 23) 131ms(maxTree 23)
+  [asserts=true ideal=2 clients=8 fan prime=32760] hangs=0/2 selfRejected/reenqueued(cid>0)=31/22528 ids=[32760,32761,32762,32763,32764,32765,32766,32767,32768,32769] runs: 134ms(maxTree 23) 149ms(maxTree 25)
+  [asserts=true ideal=2 clients=8 fan prime=32768] hangs=0/2 selfRejected/reenqueued(cid>0)=20894/20894 ids=[32768,32769,32770,32771,32772,32773,32774,32775,32776] runs: 145ms(maxTree 23) 146ms(maxTree 22)
+  [asserts=true ideal=2 clients=8 fan prime=65530] hangs=0/2 selfRejected/reenqueued(cid>0)=18636/21638 ids=[65530,65531,65532,65533,65534,65535,65536,65537,65538,65539] runs: 141ms(maxTree 23) 148ms(maxTree 25)
+  [asserts=true ideal=2 clients=8 fan prime=65536] hangs=0/2 selfRejected/reenqueued(cid>0)=18977/21967 ids=[65536,65537,65538,65539,65540,65541,65542,65543,65544] runs: 141ms(maxTree 22) 149ms(maxTree 25)
+  [asserts=true ideal=1 clients=1 fan prime=none] hangs=0/1 selfRejected/reenqueued(cid>0)=0/3200 ids=[2] runs: 39ms(maxTree 15)
+  [asserts=true ideal=1 clients=1 fan prime=32760] hangs=0/1 selfRejected/reenqueued(cid>0)=0/3200 ids=[32760] runs: 38ms(maxTree 15)
+  [asserts=true ideal=1 clients=1 fan prime=32768] hangs=1/1 selfRejected/reenqueued(cid>0)=null ids=null runs: HANG
+      | CHILD-HANG t1 not done; reenq=4 selfRejects=4 max tree so far 0 ms
+      | global quick queue  [
+      | optimus.graph.Tier1.Fsm:Siq: [3 occurrences]
+      | workThreads []
+      | waitThreads 1 [
+      | idleThreads []
+  [asserts=true ideal=1 clients=1 fan prime=65530] hangs=1/1 selfRejected/reenqueued(cid>0)=null ids=null runs: HANG
+      | CHILD-HANG t1 not done; reenq=4 selfRejects=4 max tree so far 0 ms
+      | global quick queue  [
+      | optimus.graph.Tier1.Fsm:Siq: [3 occurrences]
+      | workThreads []
+      | waitThreads 1 [
+      | idleThreads []
+  [asserts=true ideal=1 clients=1 fan prime=65536] hangs=0/1 selfRejected/reenqueued(cid>0)=0/3200 ids=[65536] runs: 37ms(maxTree 13)
+  [asserts=true ideal=1 clients=4 fan prime=none] hangs=0/1 selfRejected/reenqueued(cid>0)=0/12800 ids=[2,3,4,5] runs: 68ms(maxTree 17)
+  [asserts=true ideal=1 clients=4 fan prime=32760] hangs=0/1 selfRejected/reenqueued(cid>0)=0/12800 ids=[32760,32761,32762,32763] runs: 68ms(maxTree 17)
+  [asserts=true ideal=1 clients=4 fan prime=32768] hangs=1/1 selfRejected/reenqueued(cid>0)=null ids=null runs: HANG
+      | CHILD-HANG t1 not done; reenq=16 selfRejects=16 max tree so far 0 ms
+      | global quick queue  [
+      | optimus.graph.Tier1.Fsm:Siq: [12 occurrences]
+      | workThreads []
+      | waitThreads 4 [
+      | idleThreads []
+  [asserts=true ideal=1 clients=4 fan prime=65530] hangs=1/1 selfRejected/reenqueued(cid>0)=null ids=null runs: HANG
+      | CHILD-HANG t1 not done; reenq=16 selfRejects=16 max tree so far 0 ms
+      | global quick queue  [
+      | optimus.graph.Tier1.Fsm:Siq: [12 occurrences]
+      | workThreads []
+      | waitThreads 4 [
+      | idleThreads []
+  [asserts=true ideal=1 clients=4 fan prime=65536] hangs=1/1 selfRejected/reenqueued(cid>0)=null ids=null runs: HANG
+      | CHILD-HANG t1 not done; reenq=3212 selfRejects=12 max tree so far 20 ms
+      | global quick queue  [
+      | optimus.graph.Tier1.Fsm:Siq: [9 occurrences]
+      | workThreads []
+      | waitThreads 3 [
+      | idleThreads []
+RESULT T7 DEMONSTRATED [direct InfoDumper.graphPanic] exit=0 returned=null threw=java.lang.ExceptionInInitializerError rootCause=com.typesafe.config.ConfigException$Missing
+    | T7 panic root cause message: main/internal/utils.conf (not found): No configuration setting found for key 'eu-stack'
+    [once] exit=0 doubleCompleteDetected=3 logAndDieRecursive=1 survived1=true survived2=null inLogAndDieAfter1=true state1=SRCi: recursiveDuringSecond=-1; 
+    | Caused by: optimus.graph.GraphException: Cannot complete node twice!
+    | 09:30:06.715 [main] ERROR optimus.graph - OGScheduler: unexpected error, exiting (121).
+    | Caused by: optimus.graph.GraphException: Cannot complete node twice!
+    | Caused by: optimus.graph.GraphException: Cannot complete node twice!
+    | 09:30:06.731 [main] ERROR optimus.graph - logAndDie called recursively!
+    [twice] exit=0 doubleCompleteDetected=3 logAndDieRecursive=2 survived1=true survived2=true inLogAndDieAfter1=true state1=SRCi: recursiveDuringSecond=1; 
+    | Caused by: optimus.graph.GraphException: Cannot complete node twice!
+    | 09:30:07.406 [main] ERROR optimus.graph - OGScheduler: unexpected error, exiting (121).
+    | Caused by: optimus.graph.GraphException: Cannot complete node twice!
+    | Caused by: optimus.graph.GraphException: Cannot complete node twice!
+    | 09:30:07.421 [main] ERROR optimus.graph - logAndDie called recursively!
+    | 09:30:07.422 [main] ERROR optimus.graph - logAndDie called recursively!
+    
+RESULT T8 DEMONSTRATED [selfRemovers=1 +completer] exit=0 CME-lines=0 result=7 clientOutcome=returned wallMs=675; 
+    | T8 registered 1 self-removers + completer; limitThreads=true ideal=18
+    | T8 remover0.checkForNewWork -> removeOutOfWorkListener(this)
+    | T8 completer.onGraphStalled: completing blocked node
+    [selfRemovers=2 +completer] exit=3 CME-lines=8 result=0 clientOutcome=hung wallMs=20655 HANG; 
+    | first CME: [0.631s][info][exceptions] Exception <a 'java/util/ConcurrentModificationException'{0x0000007002e329c0}>
+    | T8 registered 2 self-removers + completer; limitThreads=true ideal=18
+    | T8 remover0.checkForNewWork -> removeOutOfWorkListener(this)
+    | [0.639s][info][exceptions] Exception <a 'java/lang/ExceptionInInitializerError'{0x00000070031e25a8}> (0x00000070031e25a8) 
+    | [0.639s][info][exceptions] Exception <a 'java/lang/ExceptionInInitializerError'{0x00000070031e25a8}>
+    |  thrown in interpreter method <{method} {0x000000012f82dee0} 'graphPanic' '(Ljava/lang/String;Ljava/lang/String;ILjava/lang/Throwable;Loptimus/graph/NodeTask;)V' in 'optimus/graph/diagnostics/InfoDumper'>
+    | [0.639s][info][exceptions] Exception <a 'java/lang/ExceptionInInitializerError'{0x00000070031e25a8}>
+    |  thrown in interpreter method <{method} {0x000000012e4dd1b8} 'panic' '(Ljava/lang/Throwable;)V' in 'optimus/graph/OGScheduler'>
+    | [0.639s][info][exceptions] Exception <a 'java/lang/ExceptionInInitializerError'{0x00000070031e25a8}>
+    | [0.639s][info][exceptions] Exception <a 'java/lang/ExceptionInInitializerError'{0x00000070031e25a8}>
+    | Exception in thread "og.worker-1-3" java.lang.ExceptionInInitializerError
+    | 	at optimus.graph.diagnostics.InfoDumper.graphPanic(InfoDumper.scala)
+    | 	at optimus.graph.OGScheduler.panic(OGScheduler.java:485)
+    | CHILD-HANG t8 client not done
+    [selfRemovers=3 +completer] exit=3 CME-lines=8 result=0 clientOutcome=hung wallMs=20704 HANG; 
+    | first CME: [0.670s][info][exceptions] Exception <a 'java/util/ConcurrentModificationException'{0x00000072df630028}>
+    | T8 registered 3 self-removers + completer; limitThreads=true ideal=18
+    | T8 remover0.checkForNewWork -> removeOutOfWorkListener(this)
+    | [0.678s][info][exceptions] Exception <a 'java/lang/ExceptionInInitializerError'{0x00000072df9dfb90}> (0x00000072df9dfb90) 
+    | [0.678s][info][exceptions] Exception <a 'java/lang/ExceptionInInitializerError'{0x00000072df9dfb90}>
+    |  thrown in interpreter method <{method} {0x000000011d82f998} 'graphPanic' '(Ljava/lang/String;Ljava/lang/String;ILjava/lang/Throwable;Loptimus/graph/NodeTask;)V' in 'optimus/graph/diagnostics/InfoDumper'>
+    | [0.678s][info][exceptions] Exception <a 'java/lang/ExceptionInInitializerError'{0x00000072df9dfb90}>
+    |  thrown in interpreter method <{method} {0x000000011c4ce6b8} 'panic' '(Ljava/lang/Throwable;)V' in 'optimus/graph/OGScheduler'>
+    | [0.678s][info][exceptions] Exception <a 'java/lang/ExceptionInInitializerError'{0x00000072df9dfb90}>
+    | [0.678s][info][exceptions] Exception <a 'java/lang/ExceptionInInitializerError'{0x00000072df9dfb90}>
+    | Exception in thread "og.worker-1-3" java.lang.ExceptionInInitializerError
+    | 	at optimus.graph.diagnostics.InfoDumper.graphPanic(InfoDumper.scala)
+    | 	at optimus.graph.OGScheduler.panic(OGScheduler.java:485)
+    | CHILD-HANG t8 client not done
+    
+==== summary
+T2: DEMONSTRATED
+T1: DEMONSTRATED
+T7: DEMONSTRATED
+T8: DEMONSTRATED
