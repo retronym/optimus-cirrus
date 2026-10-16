@@ -1,0 +1,399 @@
+W3 / W11 (jcstress) and H1 (Lincheck): NodeCacheWithLRU and PtracksArray, Phase 2 cache campaign
+===============================================================================================
+
+Machine: Apple M5 Pro (AArch64, 18 cores), Temurin 21.0.12.1. jcstress 0.16, Lincheck 2.39 (coursier).
+Every forked/Lincheck VM runs with -javaagent:entityagent.jar (CacheMC.<clinit> refuses to run without it),
+-Doptimus.profile.enableXSFT=false, and the probe property's policy forced to NCPolicy.Basic (no proxies).
+
+Commands (from probes/cache/modelcheck):
+  ./fetch.sh                      # jcstress.cp, lincheck.cp (coursier)
+  ./build.sh                      # scalac+javac ProbeDag.java/CacheFixtures.scala from probes/cache/src -> classes/fixtures;
+                                  # src/common + src/jcstress -> classes/jcstress; src/common + src/lincheck -> classes/lincheck
+  ./run.sh smoke                  # sequential sanity of the CacheMC helpers (put/get/collide/evict/resize/clear, C1 and L2)
+  ./run.sh jcstress default 'optimus\.graph\.(cache\.W3|tracking\.ttracks\.W11).*' -v
+  ./run.sh lincheck                                  # strict spec, hand-written scenarios first: fails with H1-A
+  # final runs (results/lincheck-full-*.txt, lincheck-c1-1[12].txt), one JVM per seed, all in parallel:
+  TAG=full-$i ./run.sh lincheck -Dmc.lax=clear,resize,ledger,sweep -Dmc.seed=$i -Dmc.iterations=10 -Dmc.invocations=3000 \
+      -Dmc.handwritten=$([ $i = 1 ] && echo true || echo false)                       # i = 1..10
+  TAG=c1-$i ./run.sh lincheck -Dmc.concurrency=1 -Dmc.lax=clear,resize,sweep -Dmc.seed=$i -Dmc.iterations=5 -Dmc.invocations=3000  # i = 11, 12
+  ./run.sh shards N -Dname=X [-Dmc.*]                # same thing via the script (seeds 1..N, 100/N scenarios each)
+
+Key fixtures: W3 keys are the P0 fixture TweakableLeaf (CacheMC.key, ProbeEntity(0), one int arg, attached to one
+root); H1 keys are MCKey, a plain-Java PropertyNode with the same identity (Lincheck cannot walk the fixture's
+record classes). Caches are real UNodeCache instances (unregistered from Caches.sharedCaches right after
+construction): "C1" = new UNodeCache(name, 16) (concurrency 1, no ledgers, every touch takes updateLock); "L2" =
+UNodeCache(name, 16, concurrency 2, batch 1, padding 1) (two ledgers that catch up on the second record).
+Arbiters read presence with CacheMC.liveFor (walk of the current table, no touch) and LRU/table agreement with
+CacheMC.desync (getSize() to flush ledgers, then LRU-not-table, table-not-LRU, size field minus live LRU length).
+
+Verdict summary
+---------------
+W3 (a) A_SameKey              OK. 109 M samples, never two live nodes, lookup always returns the winner (W1 holds).
+W3 (b) B_SameBucket[NonEmpty] OK. 193 M samples, no lost insert for colliding keys, empty or non-empty bucket.
+W3 (c) C_PutVsClear C1/L2     OK. 118 M samples, no LRU/table desync, no size drift.
+W3 (d) D_PutVsResize C1/L2    OPTIMUS-57931 observed as INTERESTING, as predicted: put vs setMaxSize(32) vs
+                              setMaxSize(16) leaves the new key in the LRU but not in the table (lookup misses it
+                              for good; size counts it) in 3,962 / 131.5 M (3.0e-5, C1) and 5,788 / 151.5 M
+                              (3.8e-5, L2). The other direction (table-not-LRU) and loss of an existing key: never.
+W3 (e) E_TouchVsEvict C1/L2   OK. The "hit, then evicted" case (lookup returns key 0 but the concurrent insert's
+                              eviction still removes it) is 1.54% (C1) and 0.29% (L2). See note on the spec below.
+W3 (f) F_PutClearVsHit C1/L2  Not reproduced by jcstress (62 M samples): the Lincheck-found inLedger race (H1-B)
+                              needs the hitter preempted inside one synchronized block.
+W11    LastSlotVsResize       FAILED, D12 confirmed on AArch64: 5 FORBIDDEN samples in 4.0 G over three default
+                              runs (1 / 844 M, 1 / 719 M, 3 / 2.44 G uncontended): nextFree 9, capacity 16, one null
+                              slot below nextFree, one caller missing (either actor's). Configurations: split
+                              compilation C2/C1, C2/interpreter, interpreter/C2 (C2 scheduling randomisers on) and
+                              interpreter/C1 without randomisers, so not a stress-flag artefact.
+H1 Lincheck                   Strict memo spec FAILS, three distinct ways, all with traces: H1-A put lost into
+                              a retired table (OPTIMUS-57931), H1-B (new) an entry inserted by a completed put
+                              survives a later clear() through the inLedger shortcut (concurrency > 1 only), H1-C
+                              clear() is a non-atomic sweep. With those three documented as relaxations, PASSED:
+                              L2 312 000 executions (104 scenarios x 3 000 interleavings, 10 JVMs), C1 42 000
+                              (14 x 3 000). Never two live nodes for a key outside a setMaxSize window, never a
+                              miss on a live key outside one, and LRU/table always agree except H1-A.
+                              Budget: 3 000 invocations per scenario, not the requested 10 000 (eager Lincheck
+                              instrumentation runs ~10-25 executions/s per JVM; 100 x 10 000 would be ~10 h).
+
+New findings
+------------
+H1-A (known, OPTIMUS-57931, now with a 2-actor trace) put vs setMaxSize: putIfAbsent reads `table` once and
+retries its CAS on that array; if setMaxSize swaps the table and finishes both moveEntries passes in between, the
+CAS succeeds on the retired array. The entry reaches the LRU (newEntryAdded) but no table: size counts it, every
+later lookup misses it, a concurrent put of the same key inserts a second node, and threads still holding the old
+array can hit it until they reload. Lincheck minimised it to init [put 0, put 1], par [put 2 | setMaxSize(32)]
+(results/lincheck-strict-custom.txt, validate: LRU-not-table=1). jcstress W3 (d): 3.0e-5 (C1) / 3.8e-5 (L2).
+
+H1-B (new, M) the inLedger shortcut lets an entry escape clear() (cacheConcurrency > 1 only).
+NodeCacheWithLRU.touchEntry(Ledger, entry): `if (entry.inLedger) return;` then, inside synchronized(l),
+`entry.inLedger = true` before `l.records[l.count++] = entry`. clear() -> catchupCore() peeks `if (l.count == 0)
+continue;` without the lock. Interleaving (results/lincheck-lax-3.txt, condensed):
+  T1 putIfAbsent(6): CAS NCEntryV#2 into the bucket                      [NodeCacheBase.java:133]  -- switch
+  T2 putIfAbsent(6): finds NCEntryV#2 (hit), touchEntry(Ledger#3):
+       inLedger ➜ false; MONITORENTER; inLedger = true; count ➜ 0          [NodeCacheWithLRU.java:215-225] -- switch
+  T1 newEntryAdded -> touchEntry: inLedger is true -> return (no record); putIfAbsent returns 1096
+  T3 clear(): catchupCore skips Ledger#3 (count 0), LRU walk does not contain NCEntryV#2
+  T3 getIfPresent(6): 96   <- node inserted by a put that returned before clear() started
+  T2 records[0] = NCEntryV#2; the entry reaches the LRU on the next catch-up
+So a node that was in the cache, visible, and inserted by a completed put survives a clear() that starts after
+that put returned (clear(CauseUntrackedTweakableTweaked) etc. rely on clear meaning "nothing from before"). The
+entry is also invisible to eviction and size until the hitter's append lands. Window: one hitter between two
+stores inside its synchronized block, plus a full clear. jcstress W3 (f) did not reproduce it in 31 M samples
+(L2); Lincheck found it from random scenarios in 2 of 10 seeds (lax=clear,resize run: seeds 3 and 4).
+Fix options: have the inserter always append its own record (drop the inLedger early return for new entries,
+i.e. before == null), or make catchupCore take each ledger's lock instead of peeking count.
+
+H1-C (new, L, by design but undocumented) clear() is not atomic: it removes LRU entries one at a time under
+updateLock while lookups are lock-free, so a reader sees a partially cleared cache (key 3 already gone, key 4
+still present, both inserted before the clear: results/lincheck-c1-12-partialclear.txt, concurrency 1). Matters
+only if a caller expects clear() to be a cut (H1-B makes it weaker still).
+
+H1-D (known, at-least-once by design) while setMaxSize runs, lookups miss and puts insert a second node for a live
+key; after the move both duplicates stay in the table (moveEntries reverses bucket order, so a later lookup may
+return either). Accepted by the spec inside the setMaxSize interval.
+
+Also confirmed: an insert in flight across clear() survives it (put CASes into the table, clear runs, put then
+records it): the clearing thread itself sees the node before and after its clear (results/lincheck-resize-only.txt,
+hand-written scenario 3). This is linearizable if put is placed after clear, except when another thread observed
+the node before clear started, which is the case in that trace.
+
+W3 (e) note: the brief's "stale hit then miss" is reachable under sequential consistency (walk reads value, the
+insert's eviction removes it, catchupEntry sees removed() and returns), so it is ACCEPTABLE_INTERESTING, not
+FORBIDDEN: it is the approximate-LRU case (a touch lost to a concurrent eviction), indistinguishable from an R16
+stale read of NCEntry.value. Rates 1.54% (C1), 0.29% (L2). L2 needed two inserts in actor 2: a single insert only
+lands in a ledger and never evicts before the arbiter (first run: 100% "hit; no eviction yet").
+
+W11 note: the FORBIDDEN samples are exactly ring 4b S9 / D12: nextFree 9 with a null at slot 7 and one of the two
+callers missing, so every caller at or after the gap is invisible to the traversals (I6). Rate ~1 per 0.8 G
+samples; seen with each actor in the interpreter, C1 or C2. Fix as in S9: make nextFree volatile or re-read the
+copied tail with getVolatile before the data CAS.
+
+H1 Lincheck (model checking)
+---------------------------
+Spec (MemoVerifier, nondeterministic, searched over all linearizations consistent with Lincheck's HB clocks):
+per key the set of live nodes; putIfAbsent returns a live node or inserts its own only if none is live;
+getIfPresent returns a live node and misses only if none is live; clear empties; setMaxSize is an interval
+[begin, end] inside which a miss or a second insert is allowed (at-least-once window); eviction only once more
+than maxSize entries were inserted since the last clear (never, in practice, with 8 keys). @Validate after the
+post part: LRU and table agree (desync 0,0,0). Relaxations, each one a documented deviation above:
+  lax=resize  put inside a setMaxSize may be lost (H1-A): ghost node, hittable until the resize ends; validate
+              tolerates LRU-not-table.
+  lax=clear   put = insert then LRU record; clear spares entries not yet recorded (in-flight insert).
+  lax=ledger  a hit pins the entry until it returns; clear spares pinned entries (H1-B).
+  lax=sweep   clear = interval; entries it will remove are fixed at begin and may vanish one by one (H1-C).
+Weaknesses: the at-least-once window is the whole setMaxSize call; lax=ledger lets any concurrent hit protect an
+entry, wider than the real two-store window; eviction is "anything goes" once over capacity (not reached);
+a duplicate allowed in the window is never checked for being the one a later lookup returns.
+
+Testability: Lincheck 2.39's default lazy instrumentation walks the object graph from the test instance and its
+statics and dies on record classes ("can't get field offset on a record class": ProbeDag.Key via the fixture keys,
+then SecureClassLoader$CodeSourceKey via something reachable from the cache). -Dlincheck.instrumentAllClasses=true
+(eager) works, gives full traces, and is what run.sh uses; the cost is ~10 executions/s per JVM. Lincheck 3.7 has no
+@StateRepresentation and NPEs in SnapshotTracker.restoreValues on this code base. Lincheck's own scenario generator
+is seeded identically in every JVM, so H1CacheLincheck generates scenarios itself from -Dmc.seed (uniform over the
+4 operations, keys 0..7, sizes 16|32, 4 before / 3x3 parallel / 3 after) and passes them as custom scenarios, which
+lets 10 JVMs share the budget. NodeTask still cannot be instrumented (TPDMask fields), irrelevant here: the keys are
+passive and every shared access is in NodeCacheBase / NodeCacheWithLRU / NCEntry, which the traces show
+instrumented (the entity agent does not rewrite them).
+
+Lincheck runs (results/lincheck-*.txt)
+--------------------------------------
+Strict spec (no relaxation), hand-written scenarios first: FAILS on the first one (H1-A), results/lincheck-strict-custom.txt.
+lax=resize only: FAILS on hand-written scenario 3 (insert in flight observed across clear), results/lincheck-resize-only.txt.
+lax=clear,resize, 10 JVMs x 10 generated scenarios x 10 000 (results/lincheck-lax-*.txt; the 5 still running
+  were stopped when the spec changed): FAILED seeds 1 (ghost hit on a lost insert, before ghosts were modelled),
+  3 and 4 (H1-B), 6 (H1-C), 8 (not analysed; its scenario passes under the final spec).
+concurrency 1, lax=clear,resize: FAILED seed 12 (H1-C), results/lincheck-c1-12-partialclear.txt.
+Final spec, mc.invocations=3000:
+  lincheck-c1-11.txt: PASSED 27000 executions verified, 260 needed the setMaxSize at-least-once window, 62 only linearize with a lax relaxation; 1299.6s 
+  lincheck-c1-12.txt: PASSED 15000 executions verified, 285 needed the setMaxSize at-least-once window, 124 only linearize with a lax relaxation; 823.3s 
+  lincheck-full-1.txt: PASSED 42000 executions verified, 749 needed the setMaxSize at-least-once window, 409 only linearize with a lax relaxation; 1333.9s 
+  lincheck-full-2.txt: PASSED 30000 executions verified, 8 needed the setMaxSize at-least-once window, 1 only linearize with a lax relaxation; 1316.9s 
+  lincheck-full-3.txt: PASSED 30000 executions verified, 80 needed the setMaxSize at-least-once window, 80 only linearize with a lax relaxation; 1226.0s 
+  lincheck-full-4.txt: PASSED 30000 executions verified, 375 needed the setMaxSize at-least-once window, 80 only linearize with a lax relaxation; 1307.2s 
+  lincheck-full-5.txt: PASSED 30000 executions verified, 237 needed the setMaxSize at-least-once window, 56 only linearize with a lax relaxation; 1343.6s 
+  lincheck-full-6.txt: PASSED 30000 executions verified, 269 needed the setMaxSize at-least-once window, 80 only linearize with a lax relaxation; 1178.4s 
+  lincheck-full-7.txt: PASSED 30000 executions verified, 166 needed the setMaxSize at-least-once window, 70 only linearize with a lax relaxation; 1195.1s 
+  lincheck-full-8.txt: PASSED 30000 executions verified, 319 needed the setMaxSize at-least-once window, 78 only linearize with a lax relaxation; 1316.6s 
+  lincheck-full-9.txt: PASSED 30000 executions verified, 388 needed the setMaxSize at-least-once window, 7 only linearize with a lax relaxation; 1189.1s 
+  lincheck-full-10.txt: PASSED 30000 executions verified, 382 needed the setMaxSize at-least-once window, 25 only linearize with a lax relaxation; 1234.0s 
+  (full-* = concurrency 2, lax=clear,resize,ledger,sweep, seeds 1..10, 10 generated scenarios each, seed 1 also the
+  4 hand-written ones; c1-* = concurrency 1, lax=clear,resize,sweep, seeds 11/12, 5 each, seed 11 also hand-written.
+  "needed the window" = no linearization without the setMaxSize window or a relaxation; "only lax" = every
+  linearization used a relaxation.)
+
+Trace H1-A (results/lincheck-strict-custom.txt; condensed interleaving, Lincheck's own table first)
+= Validation function validate has failed =
+| ------------------------------------------------------------------------------ |
+|             Thread 1              |      Thread 2       |       Thread 3       |
+| ------------------------------------------------------------------------------ |
+| putIfAbsent(0): 1000              |                     |                      |
+| putIfAbsent(1): 1016              |                     |                      |
+| ------------------------------------------------------------------------------ |
+| putIfAbsent(2): 1032              | setMaxSize(1): void | getIfPresent(1): 16  |
+| getIfPresent(0): 0                |                     | putIfAbsent(2): 1033 |
+| ------------------------------------------------------------------------------ |
+| getIfPresent(0): 0                |                     |                      |
+| getIfPresent(1): 16               |                     |                      |
+| getIfPresent(2): 33               |                     |                      |
+| ------------------------------------------------------------------------------ |
+| validate(): IllegalStateException |                     |                      |
+| ------------------------------------------------------------------------------ |
+
+  T1: putIfAbsent(0): 1000
+  T1: putIfAbsent(1): 1016
+  T1: putIfAbsent(2): 1032
+  T1: putIfAbsentCore(BasicPolicy#1, MCKey#3, null): MCKey#3  [NodeCacheBase.java:48]
+  T1: getLedger(): Ledger#1  [NodeCacheBase.java:91]
+  T1: table ➜ Array<NCEntryLRU>#1  [NodeCacheBase.java:95]
+  T1: Array<NCEntryLRU>#1[5].getVolatile(): null  [NodeCacheBase.java:102]
+  T1: newNCEntry(436437525, MCKey#3, null, false): NCEntryV#3  [NodeCacheBase.java:132]
+  T1: switch
+  T2: setMaxSize(1)
+  T3: getIfPresent(1): 16
+  T3: putIfAbsent(2): 1033
+  T1: Array<NCEntryLRU>#1[5].compareAndSet(null, NCEntryV#3): true  [NodeCacheBase.java:133]
+  T1: newEntryAdded(Ledger#1, NCEntryV#3)  [NodeCacheBase.java:135]
+  T1: result: 1032
+  T1: getIfPresent(0): 0
+  T1: getIfPresent(0): 0
+  T1: getIfPresent(1): 16
+  T1: getIfPresent(2): 33
+  T1: validate(): IllegalStateException
+  java.lang.IllegalStateException: desync: LRU-not-table=1 table-not-LRU=0 sizeDrift=0 table=32 entries=[k0#0, k1#16, k2#33]
+
+Trace H1-B (results/lincheck-lax-3.txt, mc.lax=clear,resize, seed 3)
+= Invalid execution results =
+| ---------------------------------------------------------------------------------- |
+|       Thread 1       |           Thread 2           |           Thread 3           |
+| ---------------------------------------------------------------------------------- |
+| getIfPresent(6): -1  |                              |                              |
+| putIfAbsent(7): 1112 |                              |                              |
+| setMaxSize(1): void  |                              |                              |
+| clear(): void        |                              |                              |
+| ---------------------------------------------------------------------------------- |
+| clear(): void        | putIfAbsent(4): 1064 [2,0,0] | clear(): void [3,2,0]        |
+| clear(): void        | setMaxSize(0): void [2,1,0]  | getIfPresent(6): 96 [3,2,1]  |
+| putIfAbsent(6): 1096 | putIfAbsent(6): 96 [2,2,0]   | putIfAbsent(0): 1000 [3,2,2] |
+| ---------------------------------------------------------------------------------- |
+| setMaxSize(0): void  |                              |                              |
+| setMaxSize(1): void  |                              |                              |
+| clear(): void        |                              |                              |
+| ---------------------------------------------------------------------------------- |
+
+  T1: putIfAbsent(6): 1096
+  T1: putIfAbsentCore(BasicPolicy#1, MCKey#3, null): MCKey#3  [NodeCacheBase.java:48]
+  T1: table ➜ Array<NCEntryLRU>#4  [NodeCacheBase.java:95]
+  T1: Array<NCEntryLRU>#4[11].getVolatile(): null  [NodeCacheBase.java:102]
+  T1: newNCEntry(-1530440469, MCKey#3, null, false): NCEntryV#2  [NodeCacheBase.java:132]
+  T1: Array<NCEntryLRU>#4[11].compareAndSet(null, NCEntryV#2): true  [NodeCacheBase.java:133]
+  T1: switch
+  T2: putIfAbsent(4): 1064
+  T2: setMaxSize(0)
+  T2: putIfAbsent(6): 96
+  T2: putIfAbsentCore(BasicPolicy#1, MCKey#5, null): MCKey#3  [NodeCacheBase.java:48]
+  T2: table ➜ Array<NCEntryLRU>#6  [NodeCacheBase.java:95]
+  T2: Array<NCEntryLRU>#6[11].getVolatile(): NCEntryV#2  [NodeCacheBase.java:102]
+  T2: getIfPresentCore(Ledger#3, NCEntryV#2, null, MCKey#5, BasicPolicy#1, -1530440469, null): MCKey#3  [NodeCacheBase.java:112]
+  T2: NCEntryV#2.getValue(): MCKey#3  [NodeCacheBase.java:169]
+  T2: NCEntryV#2.hash ➜ -1530440469  [NodeCacheBase.java:172]
+  T2: touchEntry(Ledger#3, NCEntryV#2)  [NodeCacheBase.java:201]
+  T2: NCEntryV#2.inLedger ➜ false  [NodeCacheWithLRU.java:215]
+  T2: NCEntryV#2.inLedger = true  [NodeCacheWithLRU.java:222]
+  T2: Ledger#3.count ➜ 0  [NodeCacheWithLRU.java:223]
+  T2: Ledger#3.records ➜ Array<NCEntryLRU>#2  [NodeCacheWithLRU.java:223]
+  T2: Ledger#3.count ➜ 0  [NodeCacheWithLRU.java:224]
+  T2: Ledger#3.records ➜ Array<NCEntryLRU>#2  [NodeCacheWithLRU.java:225]
+  T2: switch
+  T1: newEntryAdded(Ledger#1, NCEntryV#2)  [NodeCacheBase.java:135]
+  T1: result: 1096
+  T3: clear()
+  T3: getIfPresent(6): 96
+  T3: putIfAbsent(0): 1000
+  T2: Ledger#3.count ➜ 0  [NodeCacheWithLRU.java:225]
+  T2: Ledger#3.count = 1  [NodeCacheWithLRU.java:225]
+  T2: Array<NCEntryLRU>#2[0] = NCEntryV#2  [NodeCacheWithLRU.java:225]
+  T2: result: 96
+  T1: setMaxSize(0)
+  T1: setMaxSize(1)
+  T1: clear()
+
+Trace H1-C (results/lincheck-c1-12-partialclear.txt, concurrency 1, mc.lax=clear,resize, seed 12)
+= Invalid execution results =
+| ----------------------------------------------------------------------------------------- |
+|           Thread 1           |          Thread 2           |           Thread 3           |
+| ----------------------------------------------------------------------------------------- |
+| setMaxSize(0): void          |                             |                              |
+| putIfAbsent(3): 1048         |                             |                              |
+| putIfAbsent(3): 48           |                             |                              |
+| putIfAbsent(4): 1064         |                             |                              |
+| ----------------------------------------------------------------------------------------- |
+| getIfPresent(3): -1 [0,1,0]  | setMaxSize(1): void         | getIfPresent(7): -1 [1,1,0]  |
+| getIfPresent(4): 64 [1,1,0]  | clear(): void               | putIfAbsent(6): 1096 [1,1,1] |
+| putIfAbsent(5): 1080 [2,3,1] | getIfPresent(3): -1 [1,2,1] | getIfPresent(1): -1 [3,3,2]  |
+| ----------------------------------------------------------------------------------------- |
+| getIfPresent(1): -1          |                             |                              |
+| getIfPresent(3): -1          |                             |                              |
+| setMaxSize(1): void          |                             |                              |
+| ----------------------------------------------------------------------------------------- |
+
+  T1: setMaxSize(0)
+  T1: putIfAbsent(3): 1048
+  T1: putIfAbsent(3): 48
+  T1: putIfAbsent(4): 1064
+  T2: setMaxSize(1)
+  T2: clear()
+  T2: debug("clearing cache mc58374 shared: true")  [NodeCacheWithLRU.java:804]
+  T2: updateLock.lock()  [NodeCacheWithLRU.java:806]
+  T2: header ➜ NCEntryProfile#1  [NodeCacheWithLRU.java:820]
+  T2: NCEntryProfile#1.after ➜ NCEntryV#1  [NodeCacheWithLRU.java:820]
+  T2: header ➜ NCEntryProfile#1  [NodeCacheWithLRU.java:821]
+  T2: remove(NCEntryV#1)  [NodeCacheWithLRU.java:822]
+  T2: NCEntryV#1.removed(): false  [NodeCacheWithLRU.java:281]
+  T2: NCEntryV#1.getValue(): MCKey#1  [NodeCacheWithLRU.java:283]
+  T2: NCEntryV#1.hash ➜ 881680590  [NodeCacheWithLRU.java:286]
+  T2: Array<NCEntryLRU>#2[14].getVolatile(): NCEntryV#1  [NodeCacheWithLRU.java:289]
+  T2: NCEntryV#1.next ➜ null  [NodeCacheWithLRU.java:302]
+  T2: Array<NCEntryLRU>#2[14].compareAndSet(NCEntryV#1, null): true  [NodeCacheWithLRU.java:302]
+  T2: NCEntryV#1.remove(): 1  [NodeCacheWithLRU.java:303]
+  T2: removeValue()  [NCEntry.java:102]
+  T2: before ➜ NCEntryProfile#1  [NCEntry.java:103]
+  T2: switch
+  T1: getIfPresent(3): -1
+  T1: getIfPresent(4): 64
+  ... T1's touch of key 4 blocks on updateLock; T2's clear goes on to remove key 4 and the rest.
+
+jcstress outcome tables (-m default, all configurations)
+--------------------------------------------------------
+W3: results/jcstress-default-20261017-002925 (a-d, E C1), -004137 (E L2, two inserts), -012034 (f).
+
+.......... [OK] optimus.graph.cache.W3Cache.A_SameKey
+  Results across all configurations:
+      RESULT     SAMPLES     FREQ      EXPECT  DESCRIPTION
+  1, 1, 1, 1  59,060,802   54.06%  Acceptable  one insert; the loser found the winner
+    1, 2, .*           0    0.00%   Forbidden  each kept a different node (W1 broken)
+    2, 1, .*           0    0.00%   Forbidden  each kept a different node (W1 broken)
+  2, 2, 1, 2  50,192,452   45.94%  Acceptable  one insert; the loser found the winner
+
+.......... [OK] optimus.graph.cache.W3Cache.B_SameBucket
+  Results across all configurations:
+      RESULT     SAMPLES     FREQ      EXPECT  DESCRIPTION
+  1, 2, 1, 1  92,869,254  100.00%  Acceptable  both inserted, both found
+
+.......... [OK] optimus.graph.cache.W3Cache.B_SameBucketNonEmpty
+  Results across all configurations:
+      RESULT      SAMPLES     FREQ      EXPECT  DESCRIPTION
+  1, 2, 1, 1  100,272,774  100.00%  Acceptable  both inserted, both found
+
+.......... [OK] optimus.graph.cache.W3Cache.C_PutVsClear_C1
+  Results across all configurations:
+            RESULT     SAMPLES     FREQ      EXPECT  DESCRIPTION
+  1, 0, 0, 0, 0, 0  13,888,509   27.52%  Acceptable  put before clear: empty
+  1, 1, 0, 0, 0, 0  36,576,905   72.48%  Acceptable  put after clear: only the new key
+
+.......... [OK] optimus.graph.cache.W3Cache.C_PutVsClear_L2
+  Results across all configurations:
+            RESULT     SAMPLES     FREQ      EXPECT  DESCRIPTION
+  1, 0, 0, 0, 0, 0  44,672,972   66.54%  Acceptable  put before clear: empty
+  1, 1, 0, 0, 0, 0  22,463,162   33.46%  Acceptable  put after clear: only the new key
+
+.......... [OK] optimus.graph.cache.W3Cache.D_PutVsResize_C1
+  Results across all configurations:
+            RESULT      SAMPLES     FREQ       EXPECT  DESCRIPTION
+  1, 0, 0, 1, 0, 0        3,962   <0.01%  Interesting  OPTIMUS-57931: insert landed in a retired table; in LRU, ...
+  1, 1, 0, 0, 0, 0  131,496,340  100.00%   Acceptable  consistent
+
+.......... [OK] optimus.graph.cache.W3Cache.D_PutVsResize_L2
+  Results across all configurations:
+            RESULT      SAMPLES     FREQ       EXPECT  DESCRIPTION
+  1, 0, 0, 1, 0, 0        5,788   <0.01%  Interesting  OPTIMUS-57931: insert landed in a retired table; in LRU, ...
+  1, 1, 0, 0, 0, 0  151,544,434  100.00%   Acceptable  consistent
+
+.......... [OK] optimus.graph.cache.W3Cache.E_TouchVsEvict_C1
+  Results across all configurations:
+            RESULT     SAMPLES     FREQ       EXPECT  DESCRIPTION
+  0, 0, 0, 0, 0, 0   3,749,515   11.82%   Acceptable  evict first: lookup missed
+  1, 0, 0, 0, 0, 0     488,821    1.54%  Interesting  stale hit then evicted (touch lost to the eviction; R16 i...
+  1, 1, 1, 0, 0, 0  27,495,644   86.64%   Acceptable  touch first: key 0 kept, key 1 evicted
+
+.......... [OK] optimus.graph.cache.W3Cache.E_TouchVsEvict_L2
+  Results across all configurations:
+                RESULT     SAMPLES     FREQ       EXPECT  DESCRIPTION
+      0, 0, 1, 0, 0, 0   1,203,768    4.18%   Acceptable  evicted first: lookup missed
+      1, 0, 1, 0, 0, 0      84,860    0.29%  Interesting  stale hit then evicted (touch lost to the eviction; R16 i...
+      1, 1, 2, 0, 0, 0  27,501,084   95.52%   Acceptable  hit; key 0 kept
+
+.......... [OK] optimus.graph.cache.W3Cache.F_PutClearVsHit_C1
+  Results across all configurations:
+            RESULT     SAMPLES     FREQ      EXPECT  DESCRIPTION
+     0, 0, 0, 0, 0  31,300,798   99.45%  Acceptable  cleared
+     0, 1, 0, 0, 0     173,574    0.55%  Acceptable  cleared
+     1, 1, 0, 0, 0           0    0.00%   Forbidden  k survived a clear that started after its put returned
+
+.......... [OK] optimus.graph.cache.W3Cache.F_PutClearVsHit_L2
+  Results across all configurations:
+            RESULT     SAMPLES     FREQ      EXPECT  DESCRIPTION
+     0, 0, 0, 0, 0  30,696,006   99.07%  Acceptable  cleared
+     0, 1, 0, 0, 0     289,378    0.93%  Acceptable  cleared
+     1, 1, 0, 0, 0           0    0.00%   Forbidden  k survived a clear that started after its put returned (i...
+
+W11 run 1 (results/jcstress-default-20261017-001504):
+...... [FAILED] optimus.graph.tracking.ttracks.W11Ptracks.LastSlotVsResize
+  Results across all configurations:
+          RESULT      SAMPLES     FREQ      EXPECT  DESCRIPTION
+     9, 16, 0, 3  844,495,493  100.00%  Acceptable  both callers present, no gap
+     9, 16, 1, 1            1   <0.01%   Forbidden  D12: resize copied a null last slot; one caller lost behi...
+
+W11 run 2 (results/jcstress-default-20261017-002925):
+...... [FAILED] optimus.graph.tracking.ttracks.W11Ptracks.LastSlotVsResize
+  Results across all configurations:
+          RESULT      SAMPLES     FREQ      EXPECT  DESCRIPTION
+     9, 16, 0, 3  719,260,293  100.00%  Acceptable  both callers present, no gap
+     9, 16, 1, 2            1   <0.01%   Forbidden  D12: resize copied a null last slot; one caller lost behi...
+
+W11 run 3 (results/jcstress-default-20261017-030437, no other load):
+...... [FAILED] optimus.graph.tracking.ttracks.W11Ptracks.LastSlotVsResize
+  Results across all configurations:
+          RESULT        SAMPLES     FREQ      EXPECT  DESCRIPTION
+     9, 16, 0, 3  2,442,447,491  100.00%  Acceptable  both callers present, no gap
+     9, 16, 1, 1              1   <0.01%   Forbidden  D12: resize copied a null last slot; one caller lost behi...
+     9, 16, 1, 2              2   <0.01%   Forbidden  D12: resize copied a null last slot; one caller lost behi...

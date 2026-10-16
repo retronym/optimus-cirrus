@@ -1,0 +1,131 @@
+CacheDelayAgent: instrumented optimus/graph/cache/NodeCacheWithLRU: remove:lru.remove catchupEntry:lru.catchup setMaxSize:lru.setMaxSize.swapped
+CacheDelayAgent: instrumented optimus/graph/cache/NodeCacheBase: putIfAbsentCore:nc.put.head putIfAbsentCore:nc.put.cas
+CacheDelayAgent: instrumented optimus/graph/OGScheduler: waitForCancelledNodeToStop:sched.waitCancelled.loop
+CacheDelayAgent: instrumented optimus/graph/cache/DelayedXSProxyNode: run:xs.run
+CacheDelayAgent: instrumented optimus/graph/cache/DelayedXSFTProxyNode: offerValue:xsft.offer.beforeSync runByWaitingOrEvaluating:xsft.promised runByWaitingOrEvaluating:xsft.beforePromisedToUp
+
+== 1. hand-written property nodes (root stack) vs value oracle
+OK   root: a[M]                                                   system=1 oracle=1
+OK   root: b[M]                                                   system=10 oracle=10
+OK   root: c[M]                                                   system=11 oracle=11
+OK   root: s[M]                                                   system=5 oracle=5
+OK   root: t[M]                                                   system=0 oracle=0
+OK   root: e[M]                                                   system=0 oracle=0
+OK   root: bkMutable[M]                                           system=1 oracle=1
+OK   root: bkAsym[M]                                              system=1 oracle=1
+OK   root: bkHash[M]                                              system=1 oracle=1
+OK   SI reading tweakable: sBad[M]                                system=ISD oracle=ISD expect=ISD
+OK   arg: a[M,3]                                                  system=4 oracle=4 expect=4
+OK   combinator cached at root (second eval is a hit)             runs 1
+OK   fresh tweakable key isTrackingValue (initTrackingValue ran with the ctor-param info) 
+     info: getNode(a) at root returned DelayedXSFTProxyNode optimus.graph.ProbeEntity.a~$~SRCi:$g~ (policy XSFTPolicy)
+OK   BadKey UNSTABLE_HASH: every lookup misses                    runs +2
+OK   BadKey MUTABLE_ARG: arg 1 served arg 0's node (wrong reuse)  v(0)=1 v(1)=1 oracle(1)=3
+OK   env reader, env token 123: e[M]                              system=123 oracle=123 expect=123
+
+== 2. entities: FakeModuleEntity (property tweaks) and ProbeEntity (instance tweaks)
+OK   ProbeEntity(3) == ProbeEntity(3), hash equal                 hash=-745194177
+OK   ProbeEntity(3) != ProbeEntity(4)                             
+OK   instance tweak on ProbeEntity(3): a[e3]                      system=100 oracle=100 expect=100
+OK   same property, ProbeEntity(4) untweaked: a[e4]               system=1 oracle=1 expect=1
+OK   combinator over instance-tweaked leaf: c[e3]                 system=110 oracle=110 expect=110
+OK   module entity untweaked: a[M]                                system=1 oracle=1 expect=1
+OK   instance tweak matches an equal (not identical) entity       
+OK   property tweak (module entity): a[M]                         system=7 oracle=7 expect=7
+OK   property tweak applies to ProbeEntity(5) too: a[e5]          system=7 oracle=7 expect=7
+OK   LOCAL_CACHE: node stored in entity local cache               optimus.graph.ProbeEntity.lc~$~SRCi:$g~
+
+== 3. tweaks and scenarios
+OK   leaf under child scenario: a[M]                              system=7 oracle=7 expect=7
+OK   combinator under child scenario: c[M]                        system=17 oracle=17 expect=17
+OK   by-name property tweak b := a + 1: b[M]                      system=8 oracle=8 expect=8
+OK   by-name RHS node ran (TwkResolver -> TweakNode -> RHS)       rhsRuns +1
+OK   combinator over by-name tweak: c[M]                          system=15 oracle=15 expect=15
+OK   by-name instance tweak b[M] := a * 2: b[M]                   system=4 oracle=4 expect=4
+OK   a := a + 1 over a := 2: a[M]                                 system=3 oracle=3 expect=3
+OK   when(arg == 1) true: a[M,1]                                  system=50 oracle=50 expect=50
+OK   when(arg == 1) false: a[M,2]                                 system=3 oracle=3 expect=3
+OK   when(b > 10) with b := 20 in parent: a[M]                    system=60 oracle=60 expect=60
+OK   when(b > 10) with b := 5 in parent: a[M]                     system=1 oracle=1 expect=1
+OK   b := a in mode BYNAME, a := 9 above (fresh root): b[M]       system=3 oracle=3 expect=3
+OK   b := a in mode BIND_ONCE, a := 9 above (fresh root): b[M]    system=3 oracle=3 expect=3
+OK   b := a in mode BIND, a := 9 above (fresh root): b[M]         system=9 oracle=9 expect=9
+OK   S5: bind after byName on the same parent resolves by-name (wrong) system=3 oracle=9  [demonstrates S5/W5: shared stack, wrong value]
+OK   unordered scenario: c[M]                                     system=17 oracle=17 expect=17
+OK   nested scenario == two levels: b[M]                          system=8 oracle=8 expect=8
+OK   nested scenario gives a 2-deep stack                         
+OK   tag reader sees tag 77: t[M]                                 system=77 oracle=77 expect=77
+OK   equal scenarios on the same parent share SSCacheID           ids 47 / 47 (stacks distinct)
+OK   combinator computed under the first is a hit under the second runs 3 -> 4 -> 4, same node true, value 17
+OK   different scenario gets a different cache id                 49
+     info: Tweak.equals(bind, bindOnce) = true; evaluateIn 2 vs 3
+OK   SimpleValueTweak(key)(v) builder                             
+OK   new Tweak(info, TweakTemplate(v)) builder                    
+
+== 4. tracker driver + invalidation oracle
+CacheDelayAgent: instrumented optimus/graph/tracking/ttracks/TTrack: addCaller:ttrack.addCaller merge:ttrack.merge nodeCompleted:ttrack.completed.cas
+CacheDelayAgent: instrumented optimus/graph/tracking/DependencyTrackerQueue: scheduleAction:dtq.schedule $anonfun$evaluationBarrier$1:dtq.barrier.beforeWait $anonfun$cancelOrphanedNodesAndResetCancellationScope$1:dtq.cancelOrphans.beforeWait
+OK   tracker evaluated c/d/u once each                            
+OK   ttracks registered for the tweakables                        ttracks=2
+OK   invalidation == oracle after a := 42                         oracle=List(ta[M], tc[M], td[M]) system=List(ta[M], tc[M], td[M])
+OK   traversalId advanced by the update                           0 -> 1
+OK   combinator re-evaluates to the new value                     value=52 runs=2
+OK   unrelated node not re-run                                    
+OK   invalidation == oracle after property tweak b := 20          oracle=List(tb[M], tc[M], td[M], tu[M]) system=List(tb[M], tc[M], td[M], tu[M])
+OK   tracker value == oracle                                      
+OK   concurrent child: own queue                                  
+OK   consistent child: shared queue                               
+OK   concurrent child value == oracle                             47
+OK   consistent child value == oracle                             27
+OK   evaluateNodeKeysAsync                                        162
+OK   evaluateNodeKeysLowPriorityAsync                             62
+OK   executeBatchUpdate addTweaksImmediate                        
+OK   registerNodesInvalidated fires for a tracked node            invalidated tracked nodes: 1
+     info: workQueue=0 lowPriorityQueue=0 _currentCancellationScope=null traversalId=5 ttracks=1 state=isEvaluating:false isUpdating:false parentIsWaiting:false inflightWork:0
+OK   reflection accessors work                                    
+OK   dispose(child)                                               
+OK   TEST_ONLY_disposeAllRoots                                    
+
+== 6. state priming
+OK   UNodeCache.global replaced by a 16-entry cache               
+OK   100 distinct keys through a 16-entry cache: values right, size bounded size=16
+OK   setMaxSize(64)                                               
+OK   TEST_ONLY_setTweakableID(5)                                  mask=10
+OK   TEST_ONLY_setAssumeDependsOn(5) -> XSFT                      XSFTPolicy dependsOn=10
+OK   ttrackClearedNodeRefWatermark=1 (-Doptimus.tracking.cleanup.ttrackClearedNodeRefWatermark) 
+     info: EnableXSFT default = true; default policy of a fresh info = XSFTPolicy
+
+== 6b. child JVM priming
+OK   child JVM: global cache maxSize 16 and watermark 1           exit=0 CHILD maxSize=16 watermark=1
+
+== 7. CacheDelayAgent hooks: arm, drive, count
+     instrumented: DelayedXSFTProxyNode.offerValue:xsft.offer.beforeSync DelayedXSFTProxyNode.runByWaitingOrEvaluating:xsft.beforePromisedToUp DelayedXSFTProxyNode.runByWaitingOrEvaluating:xsft.promised DelayedXSProxyNode.run:xs.run DependencyTrackerQueue.$anonfun$cancelOrphanedNodesAndResetCancellationScope$1:dtq.cancelOrphans.beforeWait DependencyTrackerQueue.$anonfun$evaluationBarrier$1:dtq.barrier.beforeWait DependencyTrackerQueue.scheduleAction:dtq.schedule NodeCacheBase.putIfAbsentCore:nc.put.cas NodeCacheBase.putIfAbsentCore:nc.put.head NodeCacheWithLRU.catchupEntry:lru.catchup NodeCacheWithLRU.remove:lru.remove NodeCacheWithLRU.setMaxSize:lru.setMaxSize.swapped OGScheduler.waitForCancelledNodeToStop:sched.waitCancelled.loop TTrack.addCaller:ttrack.addCaller TTrack.merge:ttrack.merge TTrack.nodeCompleted:ttrack.completed.cas
+     info: f policy=XSFTPolicy g policy=XSPolicy favorReuseIsXS=true
+OK   XSFT node under child before root                            
+OK   XS node under two sibling scenarios                          
+CacheDelayAgent: instrumented optimus/graph/tracking/ttracks/PtracksArray: addCaller:ptracks.nextFree addCaller:ptracks.resize.cas addCaller:ptracks.slot.cas
+OK   tracker evaluation of 40 merge callers                       runs=40 privateCache size=16
+OK   slow low-priority node started                               
+OK   update completed while low-priority node was running         
+OK   Delay.arm(ctl, "nc.put.head") steps both threads via CacheDelay steps taken 4
+OK   hook nc.put.head fired                                       count=137
+OK   hook nc.put.cas fired                                        count=95
+OK   hook lru.remove fired                                        count=24
+OK   hook lru.catchup fired                                       count=40
+OK   hook lru.setMaxSize.swapped fired                            count=1
+OK   hook ttrack.completed.cas fired                              count=83
+OK   hook ttrack.addCaller fired                                  count=80
+OK   hook ttrack.merge fired                                      count=40
+OK   hook ptracks.nextFree fired                                  count=37
+OK   hook ptracks.resize.cas fired                                count=3
+OK   hook ptracks.slot.cas fired                                  count=37
+OK   hook xsft.promised fired                                     count=2
+OK   hook xsft.beforePromisedToUp fired                           count=2
+OK   hook xsft.offer.beforeSync fired                             count=9
+OK   hook xs.run fired                                            count=3
+OK   hook dtq.schedule fired                                      count=2
+OK   hook dtq.barrier.beforeWait fired                            count=8
+OK   hook sched.waitCancelled.loop fired                          count=4
+     info: other hooks fired: dtq.cancelOrphans.beforeWait=5
+
+SMOKE: 100 passed, 0 failed
