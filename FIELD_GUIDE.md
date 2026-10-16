@@ -416,7 +416,7 @@ sequenceDiagram
     B->>S: later, from an IO thread: node.complete(…) / scheduler.enqueue(…)
     S->>S: newWorkAdded? re-scan _qqueue / _queue; else next priority
     S->>S: still nothing and _workers.count == 1: detectCycles over waiters and tracked nodes
-    S-->>C: null → fullWait: park; 1 s timer re-checks "callbacks pending and no workers"
+    S-->>C: null → fullWait: park. 1 s timer re-checks "callbacks pending and no workers"
 ```
 
 ```java
