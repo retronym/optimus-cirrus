@@ -290,11 +290,24 @@ public final class Hunter {
     final HN[] nodes;
     final ScenarioStack[] scopeSS;
     final AtomicInteger extOutstanding = new AtomicInteger();
+    final OGScheduler[] sch; // H7: sch[0] == s
+    final int[] schedOf;
+
+    OGScheduler schedOf(int i) {
+      return sch[schedOf[i]];
+    }
 
     G(Spec sp, OGScheduler s, ScheduledThreadPoolExecutor ext, ScenarioStack base) {
       this.sp = sp;
       this.s = s;
       this.ext = ext;
+      sch = H7.ON ? H7.sch : new OGScheduler[] {s};
+      if (H7.ON) H7.lastRanOn.clear();
+      schedOf = new int[sp.n];
+      if (sch.length > 1) {
+        Random r = new Random(sp.seed * 131 + 7);
+        for (int i = 0; i < sp.n; i++) schedOf[i] = r.nextInt(sch.length);
+      }
       scopeSS = new ScenarioStack[sp.scopeRoot.length];
       for (int k = 0; k < scopeSS.length; k++) {
         ScenarioStack parent = sp.scopeParent[k] < 0 ? base : scopeSS[sp.scopeParent[k]];
@@ -303,6 +316,7 @@ public final class Hunter {
       nodes = new HN[sp.n];
       for (int i = 0; i < sp.n; i++) {
         ScenarioStack ss = sp.scopeOf[i] < 0 ? base : scopeSS[sp.scopeOf[i]];
+        if (sch.length > 1) ss = ss.withScheduler(sch[schedOf[i]].weakView);
         nodes[i] = switch (sp.kind[i]) {
           case SYNC -> new SyncN(this, i, ss);
           case FAN -> new FanN(this, i, ss);
@@ -385,7 +399,10 @@ public final class Hunter {
         c.enqueued = true;
         statEnqueued.incrementAndGet();
       }
-      ec.enqueue(this, c);
+      if (H7.ON && g.sch.length > 1 && g.schedOf[c.i] != H7.index(ec.scheduler()) && ((i + c.i) & 1) == 0) {
+        H7.crossEnqueues.incrementAndGet();
+        g.schedOf(c.i).enqueue(c); // onto the scheduler the child's scenario stack names, from another scheduler's thread
+      } else ec.enqueue(this, c);
       if (H6.ON) H6.at(c, H6.St.ENQUEUED);
     }
 
@@ -422,6 +439,7 @@ public final class Hunter {
     @Override
     public void run(OGSchedulerContext ec) {
       runs.incrementAndGet();
+      if (H7.ON) H7.ran(this, ec);
       if (H6.ON && H6.at(this, H6.St.RUNNING)) H6.busyLeaf(this);
       if (g.sp.fails[i]) {
         statFailedLeaves.incrementAndGet();
@@ -439,9 +457,10 @@ public final class Hunter {
     @Override
     public void run(OGSchedulerContext ec) {
       runs.incrementAndGet();
+      if (H7.ON) H7.ran(this, ec);
       statPromises.incrementAndGet();
       // completed from a non-graph thread with the scheduler as the EvaluationQueue (external callback)
-      g.extRun(() -> finish(g.s, g.sp.weight[i]), g.sp.promiseDelayUs[i]);
+      g.extRun(() -> finish(g.schedOf(i), g.sp.weight[i]), g.sp.promiseDelayUs[i]);
     }
   }
 
@@ -453,11 +472,12 @@ public final class Hunter {
     @Override
     public void run(OGSchedulerContext ec) {
       runs.incrementAndGet();
+      if (H7.ON) H7.ran(this, ec);
       if (H6.ON) H6.at(this, H6.St.RUNNING_INGRAPH);
       for (int j = 0; j < nk(); j++) enq(ec, kid(j));
       for (int j = 0; j < nk(); j++) {
         HN c = kid(j);
-        if (H6.ON) H6.at(this, H6.St.SYNC_WAIT);
+        if (H6.ON && (H6.at(this, H6.St.SYNC_WAIT) || H6.at(this, H6.St.SYNC_WAIT_DELAYED))) H6.syncKid = c;
         ec.runAndWait(c);
         combine(c, ec);
         if (H6.ON) H6.propagate(this, c);
@@ -476,6 +496,7 @@ public final class Hunter {
     @Override
     public void run(OGSchedulerContext ec) {
       runs.incrementAndGet();
+      if (H7.ON) H7.ran(this, ec);
       if (H6.ON) H6.at(this, H6.St.RUNNING_INGRAPH);
       pending.set(nk());
       for (int j = 0; j < nk(); j++) enq(ec, kid(j));
@@ -507,6 +528,7 @@ public final class Hunter {
     @Override
     public void run(OGSchedulerContext ec) {
       if (runs.incrementAndGet() > 1) statSeqReruns.incrementAndGet();
+      if (H7.ON) H7.ran(this, ec);
       if (!started) {
         started = true;
         for (int j = 0; j < nk(); j++) enq(ec, kid(j));
@@ -534,6 +556,7 @@ public final class Hunter {
     @Override
     public void run(OGSchedulerContext ec) {
       runs.incrementAndGet();
+      if (H7.ON) H7.ran(this, ec);
       int nAsync = 0;
       for (int j = 0; j < nk(); j++) if (!g.sp.syncEdge[i][j]) nAsync++;
       pending.set(nAsync + 1);
@@ -542,7 +565,7 @@ public final class Hunter {
       if (H6.ON) H6.at(this, H6.St.RUNNING_INGRAPH);
       for (int j = 0; j < nk(); j++)
         if (g.sp.syncEdge[i][j]) {
-          if (H6.ON) H6.at(this, H6.St.SYNC_WAIT);
+          if (H6.ON && (H6.at(this, H6.St.SYNC_WAIT) || H6.at(this, H6.St.SYNC_WAIT_DELAYED))) H6.syncKid = kid(j);
           ec.runAndWait(kid(j));
           combine(kid(j), ec);
           if (H6.ON) H6.propagate(this, kid(j));
@@ -576,6 +599,7 @@ public final class Hunter {
     @Override
     public void run(OGSchedulerContext ec) {
       runs.incrementAndGet();
+      if (H7.ON) H7.ran(this, ec);
       pending.set(nk());
       List<HN> ext = new ArrayList<>();
       for (int j = 0; j < nk(); j++) {
@@ -595,10 +619,11 @@ public final class Hunter {
                 c.enqueued = true;
                 statEnqueued.incrementAndGet();
               }
-              if (viaENA) g.s.evaluateNodeAsync(c);
-              else g.s.enqueueAndTrackCompletion(c);
+              OGScheduler cs = g.schedOf(c.i);
+              if (viaENA) cs.evaluateNodeAsync(c);
+              else cs.enqueueAndTrackCompletion(c);
               for (int j = 0; j < nk(); j++) if (kid(j) == c) registered.incrementAndGet(j);
-              c.continueWith(this, g.s);
+              c.continueWith(this, g.schedOf(i));
             },
             0);
       }
@@ -635,7 +660,7 @@ public final class Hunter {
   static final class H6 {
     static final boolean ON = Boolean.getBoolean("hunter.h6");
 
-    enum St { NEW, ENQUEUED, RUNNING, RUNNING_INGRAPH, SYNC_WAIT, ON_CHILD_COMPLETED, COMPLETED }
+    enum St { NEW, ENQUEUED, RUNNING, RUNNING_INGRAPH, SYNC_WAIT, SYNC_WAIT_DELAYED, ON_CHILD_COMPLETED, COMPLETED }
 
     static volatile G g;
     static volatile OGScheduler s;
@@ -643,7 +668,7 @@ public final class Hunter {
     static volatile St st;
     static volatile int scope;
     static final java.util.concurrent.atomic.AtomicBoolean fired = new java.util.concurrent.atomic.AtomicBoolean();
-    static volatile HN trigger, syncWaiter;
+    static volatile HN trigger, syncWaiter, syncKid;
     static volatile long leafEndNs, wfcnsEndNs;
     static final ExecutorService waiter = Executors.newSingleThreadExecutor(r -> {
       Thread t = new Thread(r, "hunter-h6wait");
@@ -653,7 +678,7 @@ public final class Hunter {
     static final List<Future<?>> pend = java.util.Collections.synchronizedList(new ArrayList<>());
     static final long[] firedBy = new long[St.values().length], notFired = new long[St.values().length], wfMax = new long[St.values().length],
         wfTimeouts = new long[St.values().length];
-    static final AtomicLong syncExc = new AtomicLong(), syncVal = new AtomicLong(), syncNotDone = new AtomicLong(), wfEarly = new AtomicLong(),
+    static final AtomicLong syncExc = new AtomicLong(), orphanIters = new AtomicLong(), orphanMaxMs = new AtomicLong(), syncKidCancelled = new AtomicLong(), syncVal = new AtomicLong(), syncNotDone = new AtomicLong(), wfEarly = new AtomicLong(),
         inGraphWaits = new AtomicLong(), inGraphGuard = new AtomicLong(), inGraphWaitMaxMs = new AtomicLong(), propagated = new AtomicLong();
 
     /** Make sure the seed has 1..3 scopes (separate stream: the DAG itself is unchanged). */
@@ -694,7 +719,7 @@ public final class Hunter {
       int n = St.values().length;
       st = St.values()[iter % n];
       scope = gg.sp.scopeRoot.length == 0 ? -1 : (iter / n) % gg.sp.scopeRoot.length;
-      trigger = syncWaiter = null;
+      trigger = syncWaiter = syncKid = null;
       leafEndNs = wfcnsEndNs = 0;
       fired.set(scope < 0);
       if (st == St.NEW && scope >= 0 && fired.compareAndSet(false, true)) {
@@ -729,6 +754,22 @@ public final class Hunter {
           var c = cs();
           c.cancel("h6 in-graph");
           long t0 = System.nanoTime();
+          HN caller = x;
+          ScheduledFuture<?> diag = ext.schedule(() -> {
+            // still spinning after 2 s: show every hunter node on every known sync stack, with its scope state
+            StringBuilder sb = new StringBuilder("H6 IN-GRAPH-WFCNS-STUCK caller=" + caller + " (on " + Thread.currentThread().getName() + ") stacks:");
+            for (OGSchedulerContext osc : HunterH4.byTid.values()) {
+              OGScheduler.Context cx = HunterH4.ctxOf(osc);
+              sb.append("\n   ").append(cx.thread == null ? "?" : cx.thread.getName()).append(" current=").append(osc.getCurrentNodeTask()).append(" awaited=").append(cx.awaitedTask).append(" frames:");
+              for (var e : new java.util.TreeMap<>(HunterH4.invert(osc.dbgHashOfSyncStack())).entrySet()) {
+                NodeTask n = e.getValue();
+                sb.append(' ').append(e.getKey()).append('=').append(n);
+                if (n instanceof HN h) sb.append(h.scenarioStack().cancelScope().isCancelled() ? "(cancelled" : "(live").append(h.isDone() ? ",done)" : ")");
+              }
+            }
+            System.out.println(sb);
+            finding("H6_INGRAPH_WFCNS_STUCK", "caller=" + caller + " waitForCancelledNodesToStop from inside the graph has not returned after 2 s");
+          }, 2, TimeUnit.SECONDS);
           try {
             s.waitForCancelledNodesToStop(c); // from inside run(): the caller marks itself, must not wait for itself
           } catch (GraphInInvalidState e) {
@@ -737,13 +778,19 @@ public final class Hunter {
             if (String.valueOf(e.getMessage()).startsWith("Waiting for cancelled node in sync stack")) inGraphGuard.incrementAndGet();
             throw e;
           } finally {
+            diag.cancel(false);
             cancelAndWait(-1);
           }
           long ms = (System.nanoTime() - t0) / 1_000_000;
           inGraphWaits.incrementAndGet();
           inGraphWaitMaxMs.accumulateAndGet(ms, Math::max);
         }
-        case SYNC_WAIT -> {
+        case SYNC_WAIT -> { // cancelled from the waiting thread as it enters runAndWait (kid enqueued, usually not started)
+          syncWaiter = x;
+          cs().cancel("h6 sync-wait");
+          cancelAndWait(-1);
+        }
+        case SYNC_WAIT_DELAYED -> {
           syncWaiter = x;
           var c = cs();
           ext.schedule(() -> c.cancel("h6 sync-wait"), 200, TimeUnit.MICROSECONDS);
@@ -816,15 +863,36 @@ public final class Hunter {
         cancelAndWait(0);
         drain();
         for (int i = 0; i < gg.sp.n; i++)
-          if (gg.nodes[i].completes.get() != before[i]) finding("H6_COMPLETED_CHANGED", gg.nodes[i] + " completed again after its scope was cancelled post-completion");
+          if (before[i] > 0 && gg.nodes[i].completes.get() != before[i]) finding("H6_COMPLETED_CHANGED", gg.nodes[i] + " completed again after its scope was cancelled post-completion");
       }
       if (!fired.get()) notFired[st.ordinal()]++;
       drain();
+      // A sync parent that rethrows leaves later kids enqueued but unawaited (orphans): the clients can be done
+      // before they are. "Every node ends done" is checked after they had 3 s to finish.
+      long t0 = System.nanoTime();
+      int orphans = 0;
+      for (HN x : gg.nodes) if (x.enqueued && !x.isDone()) orphans++;
+      if (orphans > 0) {
+        orphanIters.incrementAndGet();
+        while ((System.nanoTime() - t0) < 3_000_000_000L) {
+          boolean all = true;
+          for (HN x : gg.nodes) if (x.enqueued && !x.isDone()) all = false;
+          if (all) break;
+          Thread.sleep(1);
+        }
+        orphanMaxMs.accumulateAndGet((System.nanoTime() - t0) / 1_000_000, Math::max);
+      }
       HN w = syncWaiter;
       if (w != null) {
+        HN k = syncKid;
+        boolean kidCancelled = k != null && k.isDoneWithException() && isCancellation(k.exception());
+        if (kidCancelled) syncKidCancelled.incrementAndGet();
         if (!w.isDone()) syncNotDone.incrementAndGet();
         else if (w.isDoneWithException()) syncExc.incrementAndGet();
-        else syncVal.incrementAndGet();
+        else {
+          syncVal.incrementAndGet();
+          if (kidCancelled) finding("H6_SYNC_SWALLOWED", w + " returned a value although its awaited kid " + k + " was cancelled");
+        }
       }
     }
 
@@ -842,11 +910,80 @@ public final class Hunter {
       for (St x : St.values())
         sb.append(" h6.").append(x).append("=fired:").append(firedBy[x.ordinal()]).append(",notReached:").append(notFired[x.ordinal()]).append(",wfcnsMaxMs:")
             .append(wfMax[x.ordinal()]).append(",timeouts:").append(wfTimeouts[x.ordinal()]);
-      sb.append(" h6syncWaiter=exception:").append(syncExc).append(",value:").append(syncVal).append(",notDone:").append(syncNotDone)
+      sb.append(" h6syncWaiter=exception:").append(syncExc).append(",value:").append(syncVal).append(",notDone:").append(syncNotDone).append(",awaitedKidCancelled:").append(syncKidCancelled)
           .append(" h6wfcnsEarly=").append(wfEarly).append(" h6inGraphWaits=").append(inGraphWaits).append(",maxMs:").append(inGraphWaitMaxMs)
-          .append(" h6propagated=").append(propagated).append(" h6expectedGIIS=").append(inGraphGuard);
+          .append(" h6propagated=").append(propagated).append(" h6expectedGIIS=").append(inGraphGuard).append(" h6orphanIters=").append(orphanIters).append(",maxSettleMs:").append(orphanMaxMs);
       return sb.toString().trim();
     }
+  }
+
+
+  // ================================================================== H7 multi-scheduler
+
+  /**
+   * -Dhunter.h7=K (2..4): K OGSchedulers (the default plus K-1 new OGScheduler("h7sN", ideal,
+   * NORM_PRIORITY)). Every node's scenario stack names one of them (withScheduler(weakView)), clients
+   * enter scheduler (client % K), half of the parent->child enqueues whose child names another
+   * scheduler go to that scheduler's global enqueue, promise completions and external launches use
+   * the node's scheduler, continueWith crosses schedulers freely. Oracles: H3/H5 per scheduler, JMX
+   * deadlock detection in the hang dump (R4), and with keepTaskSchedulerAffinity every run of a node
+   * happens on the scheduler its scenario stack names at that moment, and a re-run (SEQ) stays on
+   * the scheduler of the previous run.
+   */
+  static final class H7 {
+    static final int K = Integer.getInteger("hunter.h7", 1);
+    static final boolean ON = K > 1;
+    static OGScheduler[] sch;
+    static final AtomicLong crossEnqueues = new AtomicLong(), mismatchSS = new AtomicLong(), offAssigned = new AtomicLong(), reruns = new AtomicLong(),
+        rerunMoved = new AtomicLong();
+    static AtomicLong[] runsOn;
+    static final java.util.concurrent.ConcurrentHashMap<HN, OGScheduler> lastRanOn = new java.util.concurrent.ConcurrentHashMap<>();
+
+    static void init(OGScheduler s0) throws Exception {
+      sch = new OGScheduler[K];
+      sch[0] = s0;
+      int ideal = F_IDEAL.getInt(s0);
+      for (int k = 1; k < K; k++) sch[k] = new OGScheduler("h7s" + k + "-", ideal, Thread.NORM_PRIORITY);
+      runsOn = new AtomicLong[K];
+      for (int k = 0; k < K; k++) runsOn[k] = new AtomicLong();
+      System.out.println("KV h7init K=" + K + " affinity=" + Settings.keepTaskSchedulerAffinity + " ideal=" + ideal);
+    }
+
+    static int index(Scheduler x) {
+      for (int k = 0; k < sch.length; k++) if (sch[k] == x) return k;
+      return -1;
+    }
+
+    static void ran(HN x, OGSchedulerContext ec) {
+      OGScheduler on = (OGScheduler) ec.scheduler();
+      int k = index(on);
+      if (k >= 0) runsOn[k].incrementAndGet();
+      Scheduler named = x.scenarioStack().siParams().scheduler().get();
+      if (Settings.keepTaskSchedulerAffinity && named != on) {
+        if (mismatchSS.incrementAndGet() <= 5) finding("H7_AFFINITY_SS", x + " ran on s" + k + " but its scenario stack names s" + index(named));
+      }
+      if (k != x.g.schedOf[x.i]) offAssigned.incrementAndGet();
+      OGScheduler prev = lastRanOn.put(x, on);
+      if (prev != null) {
+        reruns.incrementAndGet();
+        if (prev != on) {
+          rerunMoved.incrementAndGet();
+          if (Settings.keepTaskSchedulerAffinity && rerunMoved.get() <= 3) System.out.println("H7 note: " + x + " re-ran on s" + k + " after running on s" + index(prev));
+        }
+      }
+    }
+
+    static String summary() {
+      StringBuilder sb = new StringBuilder("K:" + K + ",affinity:" + Settings.keepTaskSchedulerAffinity + ",runsOn:");
+      for (int k = 0; k < K; k++) sb.append(k == 0 ? "" : "/").append(runsOn[k]);
+      sb.append(",crossEnq:").append(crossEnqueues).append(",offAssigned:").append(offAssigned).append(",ssMismatch:").append(mismatchSS)
+          .append(",reruns:").append(reruns).append(",rerunMoved:").append(rerunMoved);
+      return sb.toString();
+    }
+  }
+
+  static int k(OGScheduler s) {
+    return H7.ON ? H7.index(s) : 0;
   }
 
   // ================================================================== oracles
@@ -1113,6 +1250,54 @@ public final class Hunter {
       ts.start();
       ts.join(5000);
       if (ts.isAlive()) System.out.println("(OGScheduler.toString() did not return in 5 s: _lock held?)");
+      if (H7.ON)
+        for (int k = 1; k < H7.sch.length; k++) {
+          OGScheduler sk = H7.sch[k];
+          Thread tk = new Thread(() -> System.out.println("---- H7 scheduler " + k(sk) + " toString()\n" + sk), "hunter-dump");
+          tk.setDaemon(true);
+          tk.start();
+          tk.join(5000);
+          if (tk.isAlive()) {
+            System.out.println("(H7 scheduler " + k(sk) + " toString() did not return in 5 s: _lock held?)");
+            cls.append("lock-held(s" + k(sk) + ") ");
+          }
+          for (OGScheduler.Context c : contexts(sk, F_WAITERS))
+            System.out.println("  h7 waiter s" + k(sk) + " " + (c.thread == null ? "?" : c.thread.getName()) + " tid=" + c.threadID + " parked=" + c.parked + " awaited=" + c.awaitedTask
+                + HunterH4.postMortem(c));
+        }
+      if (Settings.useVirtualThreads) {
+        // virtual threads are not in Thread.getAllStackTraces(): dump them with jcmd and print the graph frames
+        try {
+          Path f = logDir().resolve("vtdump-" + ProcessHandle.current().pid() + ".txt");
+          Process p = new ProcessBuilder("jcmd", Long.toString(ProcessHandle.current().pid()), "Thread.dump_to_file", "-overwrite", f.toString()).redirectErrorStream(true).start();
+          p.getInputStream().readAllBytes();
+          p.waitFor(20, TimeUnit.SECONDS);
+          List<String> lines = Files.readAllLines(f);
+          int vts = 0;
+          for (String l : lines) if (l.startsWith("#") && l.contains("virtual")) vts++;
+          System.out.println("VT-DUMP " + f + " virtualThreads=" + vts + " (graph frames follow)");
+          String hdr = null;
+          int shown = 0;
+          for (String l : lines) {
+            if (l.startsWith("#")) hdr = l;
+            else if (l.contains("optimus.graph.OGScheduler.") || l.contains("optimus.graph.Hunter")) {
+              if (hdr != null && shown++ < 60) System.out.println("  " + hdr.trim());
+              hdr = null;
+              if (shown < 200) System.out.println("      " + l.trim());
+            }
+          }
+        } catch (Exception e) {
+          System.out.println("VT-DUMP failed " + e);
+        }
+      }
+      // JMX deadlock detection (monitors and ownable synchronizers): the R4 lock-order shape shows up here
+      long[] dl = java.lang.management.ManagementFactory.getThreadMXBean().findDeadlockedThreads();
+      if (dl != null && dl.length > 0) {
+        cls.append("jmx-deadlock ");
+        for (var ti : java.lang.management.ManagementFactory.getThreadMXBean().getThreadInfo(dl, true, true))
+          System.out.println("DEADLOCK-JMX " + ti.getThreadName() + " waiting on " + ti.getLockName() + " held by " + ti.getLockOwnerName() + " locked="
+              + Arrays.toString(ti.getLockedMonitors()) + " sync=" + Arrays.toString(ti.getLockedSynchronizers()));
+      }
       // 3. unsynchronised snapshot for classification
       OGScheduler.Context[] workers = contexts(s, F_WORKERS), waiters = contexts(s, F_WAITERS), idle = contexts(s, F_IDLE);
       int[] qq = wqCounts((OGSchedulerContext.WorkQueue) F_QQ.get(s));
@@ -1221,6 +1406,7 @@ public final class Hunter {
     if (H6.ON) H6.addScopes(sp);
     EvaluationContext.initializeWithoutRuntime();
     OGScheduler s = (OGScheduler) EvaluationContext.scheduler();
+    if (H7.ON) H7.init(s);
     ScenarioStack base = EvaluationContext.scenarioStack();
     int sid = F_SID.getInt(s);
     System.out.println("KV seed=" + seed + " cfg=" + cfg + " ideal=" + F_IDEAL.getInt(s) + " limitThreads=" + Settings.limitThreads
@@ -1244,7 +1430,8 @@ public final class Hunter {
       qs.add(q);
       int ci = c;
       Thread t = new Thread(() -> {
-        EvaluationContext.initializeWithoutRuntime();
+        if (H7.ON) EvaluationContext.initialize(H7.sch[ci % H7.sch.length], optimus.platform.ScenarioState.minimal());
+        else EvaluationContext.initializeWithoutRuntime();
         OGSchedulerContext ec = OGSchedulerContext.current();
         while (true) {
           Job j;
@@ -1318,6 +1505,11 @@ public final class Hunter {
       checkGraph(g);
       last = settle(s, 2000);
       List<String> v = last.violations();
+      if (H7.ON)
+        for (int k = 1; k < H7.sch.length; k++) {
+          List<String> vk = settle(H7.sch[k], 2000).violations();
+          for (String x : vk) v.add("s" + k + ":" + x);
+        }
       if (!v.isEmpty()) {
         String key = String.join(",", v.stream().map(x -> x.replaceAll("=.*", "")).toList());
         if (!h5.contains(key)) {
@@ -1346,6 +1538,7 @@ public final class Hunter {
     System.out.println("KV h5 " + fin + " violations=" + (fin.violations().isEmpty() ? "none" : String.join(",", fin.violations())));
     System.out.println("KV h4 " + HunterH4.summary());
     if (H6.ON) System.out.println("KV h6 " + H6.summary());
+    if (H7.ON) System.out.println("KV h7=" + H7.summary());
     System.out.flush();
     int code = 0;
     boolean oracle = false, h5only = false;
@@ -1511,6 +1704,23 @@ public final class Hunter {
       z = kk;
       S[0] = new Fn("A2", (n, ec) -> {}); // placeholder for the hang printout
 
+    }
+    if (Boolean.getBoolean("inv.u")) {
+      // U: the R9 end state through an UNSTAMPED task (seed 14's entry, H4). T parks inside S's frame (causality 2);
+      // a non-graph thread enqueues a fresh node Z2 (causality 0/0) to the scheduler; canTake treats "no causality
+      // information" as compatible with every waiter, so enqueue() hands Z2 to T, which runs it inside S's frame;
+      // Z2 runAndWaits S, suspended below it on the same stack.
+      Fn z2 = new Fn("Z2", (n, ec) -> {
+        ec.runAndWait(S[0]);
+        n.done(ec);
+      });
+      ext.schedule(() -> s.enqueue(z2), p1ms, TimeUnit.MILLISECONDS);
+      r = new Fn("R", (n, ec) -> {
+        ec.enqueue(n, S[0]);
+        ec.runAndWait(S[0]);
+        n.done(ec);
+      });
+      z = z2;
     }
     final Fn rr = r, zz = z;
      System.out.println("KV inv n2=" + Boolean.getBoolean("inv.n2") + " ideal=" + F_IDEAL.getInt(s) + " limitThreads=" + Settings.limitThreads + " asserts=" + Settings.schedulerAsserts);
@@ -1765,8 +1975,8 @@ public final class Hunter {
             if (rem < 5) break;
             List<String> argv = new ArrayList<>(List.of("java"));
             for (String f : flags(cfg).split(" ")) if (!f.isEmpty()) argv.add(f);
-            for (String k : new String[] {"hunter.budgetMs", "hunter.iters", "hunter.minIters", "hunter.wdMs", "hunter.h4"})
-              if (System.getProperty(k) != null) argv.add("-D" + k + "=" + System.getProperty(k));
+            argv.addAll(passThrough());
+            if (System.getProperty("hunter.wdMs") != null) argv.add("-Dhunter.wdMs=" + System.getProperty("hunter.wdMs"));
             for (String a : cmd.substring(5).trim().split("\\s+")) argv.add(a);
             argv.addAll(List.of("--soak", Long.toString(seed), cfg, Long.toString(rem)));
             Path log = logDir().resolve("soak-" + cfg + "-seg" + segment + "-s" + seed + ".log");
@@ -1847,13 +2057,326 @@ public final class Hunter {
     System.out.flush();
   }
 
+
+  // ================================================================== H8 resource exhaustion
+
+  static final class H8Info { // lazy: the parent JVM has no entity agent and cannot initialise NodeTaskInfo
+    static final NodeTaskInfo AMOW = NodeTaskInfo.userDefined("[h8 atMostOneWaiter]", NodeTaskInfo.AT_MOST_ONE_WAITER);
+  }
+  static final AtomicLong h8Delayed = new AtomicLong(), h8MaxDepth = new AtomicLong(), h8MaxCausality = new AtomicLong(), h8DelaySeen = new AtomicLong();
+  static volatile String h8DeepestInfo = "";
+
+  /**
+   * H8 child: "deep:N:default|amow" = N nested sync waits (each node runAndWaits the next, inline on
+   * the client thread); "fanchain:N[:ext]" = N nodes, each continueWith on the next, completing in
+   * onChildCompleted with the cache-proxy pattern (eq.delayOnChildCompleted / afterOnChildCompleted),
+   * leaf completed on the graph thread or (ext) from a non-graph thread; "seqchain:N" = the same
+   * chain with the default NodeTask.onChildCompleted (re-enqueue); "heap:M" = M priority-1 nodes
+   * enqueued from a non-graph thread while the only graph thread runs, then run by it via runAndWait.
+   */
+  static void h8Child(String variant) throws Exception {
+    EvaluationContext.initializeWithoutRuntime();
+    OGScheduler s = (OGScheduler) EvaluationContext.scheduler();
+    ScenarioStack ss = EvaluationContext.scenarioStack();
+    String[] v = variant.split(":");
+    int n = Integer.parseInt(v[1]);
+    System.out.println("KV h8 variant=" + variant + " ideal=" + F_IDEAL.getInt(s) + " xss=" + java.lang.management.ManagementFactory.getRuntimeMXBean().getInputArguments().stream().filter(a -> a.startsWith("-Xss")).findFirst().orElse("default")
+        + " syncStackSafetyLimit=" + System.getProperty("optimus.scheduler.syncStackSafetyLimit", "100(default)") + " proxyChainStackLimit=" + optimus.graph.DiagnosticSettings.proxyChainStackLimit);
+    ScheduledThreadPoolExecutor ext = new ScheduledThreadPoolExecutor(1, r -> {
+      Thread t = new Thread(r, "hunter-ext-h8");
+      t.setDaemon(true);
+      return t;
+    });
+    NodeTask root, warm = null;
+    java.util.function.Supplier<String> after = () -> "";
+    switch (v[0]) {
+      case "deep" -> {
+        boolean amow = v.length > 2 && v[2].equals("amow");
+        final class D extends NodeTask {
+          final int k;
+          D next;
+          D(int k) {
+            this.k = k;
+            attach(ss);
+          }
+          @Override
+          public NodeTaskInfo executionInfo() {
+            return amow ? H8Info.AMOW : NodeTaskInfo.Default;
+          }
+          @Override
+          public void run(OGSchedulerContext ec) {
+            h8MaxDepth.accumulateAndGet(k, Math::max);
+            if (HunterH4.CUR != null) h8MaxCausality.accumulateAndGet((int) HunterH4.CUR.get(ec), Math::max);
+            if (next != null) {
+              ec.runAndWait(next);
+              if (next.isDoneWithException()) {
+                Throwable e = next.exception();
+                if (e instanceof RuntimeException re) throw re;
+                if (e instanceof Error er) throw er;
+                throw new RuntimeException(e);
+              }
+            } else h8DeepestInfo = "leaf reached at depth " + k + " causality=" + (HunterH4.CUR == null ? "?" : HunterH4.CUR.get(ec)) + " syncStack=" + ec.dbgHashOfSyncStack().size();
+            complete(ec);
+          }
+          @Override
+          public String toString() {
+            return "D#" + k;
+          }
+        }
+        D[] d = new D[n];
+        for (int k = n - 1; k >= 0; k--) {
+          d[k] = new D(k);
+          if (k + 1 < n) d[k].next = d[k + 1];
+        }
+        root = d[0];
+        // warm-up chain of 30 on the same thread first, so no class is loaded (and transformed by the agents) deep in the stack
+        D[] w = new D[30];
+        for (int k = 29; k >= 0; k--) {
+          w[k] = new D(k);
+          if (k + 1 < 30) w[k].next = w[k + 1];
+        }
+        warm = w[0];
+        after = () -> {
+          int firstExc = -1, notDone = 0;
+          for (int k = 0; k < n; k++) {
+            if (!d[k].isDone()) notDone++;
+            else if (d[k].isDoneWithException() && firstExc < 0) firstExc = k;
+          }
+          Throwable e = d[0].isDoneWithException() ? d[0].exception() : null;
+          return "maxDepth=" + h8MaxDepth + " maxCausality=" + h8MaxCausality + " " + h8DeepestInfo + " notDone=" + notDone + " rootException=" + (e == null ? "none" : e.getClass().getSimpleName())
+              + " deepestNodeWithException=" + (firstExc < 0 ? "none" : "D#" + (n - 1 - countExcFromBottom(d)));
+        };
+      }
+      case "fanchain", "seqchain" -> {
+        boolean proxy = v[0].equals("fanchain"), extLeaf = variant.contains(":ext"), guard = variant.contains(":guard");
+        final class C extends NodeTask {
+          final int k;
+          C next;
+          C(int k) {
+            this.k = k;
+            attach(ss);
+          }
+          @Override
+          public void run(OGSchedulerContext ec) {
+            if (next == null) {
+              if (extLeaf) ext.schedule(() -> complete(s), 1, TimeUnit.MILLISECONDS);
+              else complete(ec);
+              return;
+            }
+            if (!proxy && next.isDone()) {
+              complete(ec);
+              return;
+            }
+            ec.enqueue(this, next);
+            next.continueWith(this, ec);
+          }
+          @Override
+          protected void onChildCompleted(EvaluationQueue eq, NodeTask child) {
+            if (!proxy) {
+              super.onChildCompleted(eq, child); // default: markAsRunnable + re-enqueue
+              return;
+            }
+            if (guard && optimus.graph.DiagnosticSettings.proxyChainStackLimit <= -1) { // as DelayedProxyNodeNoReEnqueue: -1 disables the mechanism
+              complete(eq);
+              return;
+            }
+            if (!eq.delayOnChildCompleted(this, child)) {
+              try {
+                complete(eq);
+              } finally {
+                eq.afterOnChildCompleted();
+              }
+            } else h8Delayed.incrementAndGet();
+          }
+          @Override
+          public String toString() {
+            return "C#" + k;
+          }
+        }
+        C[] c = new C[n];
+        for (int k = n - 1; k >= 0; k--) {
+          c[k] = new C(k);
+          if (k + 1 < n) c[k].next = c[k + 1];
+        }
+        root = c[0];
+        // sampler: is a DelayOnChildCompletedNode visible on the global queue or a waiter's chain?
+        Thread smp = new Thread(() -> {
+          while (true) {
+            try {
+              int seen = 0;
+              NodeTask[] a = (NodeTask[]) F_WQ_Q.get(F_QQ.get(s));
+              for (NodeTask t : a) if (t != null && t.getClass().getSimpleName().equals("DelayOnChildCompletedNode")) seen++;
+              for (OGScheduler.Context cx : contexts(s, F_WORKERS)) for (NodeTask t : (NodeTask[]) F_WQ_Q.get(cx.queue)) if (t != null && t.getClass().getSimpleName().equals("DelayOnChildCompletedNode")) seen++;
+              for (OGScheduler.Context cx : contexts(s, F_WAITERS)) for (NodeTask t : (NodeTask[]) F_WQ_Q.get(cx.queue)) if (t != null && t.getClass().getSimpleName().equals("DelayOnChildCompletedNode")) seen++;
+              int fs = seen;
+              h8DelaySeen.accumulateAndGet(fs, Math::max);
+              Thread.sleep(0, 200_000);
+            } catch (Throwable ignored) {
+            }
+          }
+        }, "hunter-h8-sampler");
+        smp.setDaemon(true);
+        smp.start();
+        after = () -> {
+          int notDone = 0, exc = 0;
+          for (C x : c) {
+            if (!x.isDone()) notDone++;
+            else if (x.isDoneWithException()) exc++;
+          }
+          Throwable e = c[0].isDoneWithException() ? c[0].exception() : null;
+          return "delayedOnChildCompleted=" + h8Delayed + " maxDelayNodesSeenQueued=" + h8DelaySeen + " notDone=" + notDone + " withException=" + exc
+              + " rootException=" + (e == null ? "none" : e.getClass().getSimpleName() + ":" + e.getMessage());
+        };
+      }
+      case "heap" -> {
+        final class P extends NodeTask {
+          P() {
+            attach(ss);
+          }
+          @Override
+          public int priority() {
+            return 1;
+          }
+          @Override
+          public void run(OGSchedulerContext ec) {
+            complete(ec);
+          }
+        }
+        P[] ps = new P[n];
+        long[] retained = new long[3];
+        String[] histo = new String[1];
+        final class R extends NodeTask {
+          R() {
+            attach(ss);
+          }
+          @Override
+          public void run(OGSchedulerContext ec) {
+            CountDownLatch l = new CountDownLatch(1);
+            ext.execute(() -> { // non-graph thread: OGScheduler.enqueue with no waiter -> _queue.offer (priority != 0)
+              for (int k = 0; k < n; k++) {
+                ps[k] = new P();
+                s.enqueue(ps[k]);
+              }
+              l.countDown();
+            });
+            try {
+              l.await();
+              retained[0] = qsize(s);
+              for (P x : ps) ec.runAndWait(x); // the only graph thread runs them directly; they stay on _queue
+              retained[1] = qsize(s);
+              System.gc();
+              histo[0] = histogram("Hunter\\$\\d*P$");
+            } catch (Exception e) {
+              throw new RuntimeException(e);
+            }
+            complete(ec);
+          }
+        }
+        root = new R();
+        after = () -> {
+          try {
+            retained[2] = qsize(s);
+          } catch (Exception e) {
+            return "error " + e;
+          }
+          int doneOnQ = 0;
+          return "queueSizeAfterEnqueue=" + retained[0] + " queueSizeAfterAllRunAndDone(inGraph)=" + retained[1] + " queueSizeAfterExitGraph=" + retained[2] + " histogram=[" + histo[0] + "]";
+        };
+      }
+      default -> throw new IllegalArgumentException(variant);
+    }
+    CountDownLatch done = new CountDownLatch(1);
+    Throwable[] thrown = new Throwable[1];
+    NodeTask r0 = root, w0 = warm;
+    Thread t = new Thread(() -> {
+      EvaluationContext.initializeWithoutRuntime();
+      try {
+        if (w0 != null) {
+          OGSchedulerContext.current().runAndWait(w0);
+          h8MaxDepth.set(0);
+          h8MaxCausality.set(0);
+          h8DeepestInfo = "";
+          System.out.println("KV h8warm done=" + w0.isDone());
+        }
+        OGSchedulerContext.current().runAndWait(r0);
+      } catch (Throwable e) {
+        thrown[0] = e;
+      }
+      done.countDown();
+    }, "hunter-client-h8");
+    t.setDaemon(true);
+    long t0 = System.nanoTime();
+    t.start();
+    long wd = Long.getLong("hunter.wdMs", 60_000);
+    if (!done.await(wd, TimeUnit.MILLISECONDS)) {
+      System.out.println("H8-HANG after " + wd + " ms " + after.get());
+      for (StackTraceElement e : t.getStackTrace()) System.out.println("    " + e);
+      System.out.println(s.toString());
+      System.out.flush();
+      Runtime.getRuntime().halt(3);
+    }
+    if (thrown[0] != null) {
+      System.out.println("H8-CLIENT-THREW " + thrown[0] + " cause=" + thrown[0].getCause());
+      StackTraceElement[] st = thrown[0].getStackTrace();
+      for (int k = 0; k < Math.min(25, st.length); k++) System.out.println("    " + st[k]);
+      System.out.println("    ... " + st.length + " frames; bottom:");
+      for (int k = Math.max(0, st.length - 8); k < st.length; k++) System.out.println("    " + st[k]);
+    }
+    System.out.println("KV h8result ms=" + (System.nanoTime() - t0) / 1_000_000 + " clientThrew=" + (thrown[0] == null ? "no" : thrown[0].getClass().getSimpleName()) + " rootDone=" + root.isDone()
+        + " rootException=" + root.isDoneWithException());
+    System.out.println("H8 " + after.get());
+    Acct a = settle(s, 2000);
+    if (variant.startsWith("heap")) {
+      Thread.sleep(3000);
+      System.gc();
+      System.out.println("H8 heap after settle+3s: queueSize=" + qsize(s) + " histogram=[" + histogram("Hunter\\$\\d*P$") + "] workers=" + ((OGScheduler.Contexts) F_WORKERS.get(s)).count
+          + " idle=" + ((OGScheduler.Contexts) F_IDLE.get(s)).count);
+    }
+    System.out.println("KV h5 " + a + " violations=" + (a.violations().isEmpty() ? "none" : String.join(",", a.violations())));
+    System.out.flush();
+    Runtime.getRuntime().halt(0);
+  }
+
+  static int countExcFromBottom(NodeTask[] d) {
+    int c = 0;
+    for (int k = d.length - 1; k >= 0 && !(d[k].isDone() && d[k].isDoneWithException()); k--) c++;
+    return c;
+  }
+
+  static int qsize(OGScheduler s) throws Exception {
+    synchronized (F_LOCK.get(s)) {
+      return ((java.util.PriorityQueue<?>) F_Q.get(s)).size();
+    }
+  }
+
+  /** jcmd GC.class_histogram of this JVM, lines matching the regex (plus the total). */
+  static String histogram(String regex) {
+    try {
+      Process p = new ProcessBuilder("jcmd", Long.toString(ProcessHandle.current().pid()), "GC.class_histogram").redirectErrorStream(true).start();
+      List<String> out = new String(p.getInputStream().readAllBytes()).lines().toList();
+      p.waitFor();
+      StringBuilder sb = new StringBuilder();
+      java.util.regex.Pattern pt = java.util.regex.Pattern.compile(regex);
+      for (String l : out) if (pt.matcher(l).find() || l.startsWith("Total")) sb.append(l.trim().replaceAll("\\s+", " ")).append("; ");
+      return sb.toString();
+    } catch (Exception e) {
+      return "jcmd failed " + e;
+    }
+  }
+
   // ================================================================== parent
 
   static String flags(String cfg) {
     // i{ideal}-a{0|1}-d{0|1}-lt{0|1}
     String[] p = cfg.split("-");
     String ideal = p[0].substring(1), a = p[1].substring(1), d = p[2].substring(1), lt = p[3].substring(2);
-    return "-Doptimus.gthread.ideal=" + ideal + " -Doptimus.graph.limitThreads=" + (lt.equals("1")) + " -Doptimus.scheduler.asserts="
+    String extra = "";
+    for (int x = 4; x < p.length; x++) {
+      if (p[x].startsWith("s")) extra += " -Dhunter.h7=" + p[x].substring(1);
+      if (p[x].startsWith("af")) extra += " -Doptimus.graph.keepTaskSchedulerAffinity=" + p[x].substring(2).equals("1");
+      if (p[x].equals("vt")) extra += " -Doptimus.graph.useVirtualThreads=true";
+    }
+    return extra.trim() + " -Doptimus.gthread.ideal=" + ideal + " -Doptimus.graph.limitThreads=" + (lt.equals("1")) + " -Doptimus.scheduler.asserts="
         + a.equals("1") + (d.equals("1") ? " -Dprobes.delay.maxNanos=" + System.getProperty("hunter.delayNanos", "50000") : "")
         + (d.equals("1") && System.getProperty("hunter.delayPoints") != null ? " -Dprobes.delay.points=" + System.getProperty("hunter.delayPoints") : "");
   }
@@ -1880,6 +2403,16 @@ public final class Hunter {
 
   static final AtomicInteger runCounter = new AtomicInteger();
 
+  /** Every -Dhunter.* knob of the parent goes to the children, except the ones the parent sets per child. */
+  static List<String> passThrough() {
+    List<String> r = new ArrayList<>();
+    for (String k : System.getProperties().stringPropertyNames())
+      if (k.startsWith("hunter.") && !List.of("hunter.wdMs", "hunter.maxN", "hunter.delayNanos", "hunter.delayPoints", "hunter.tag").contains(k))
+        r.add("-D" + k + "=" + System.getProperty(k));
+    r.sort(null);
+    return r;
+  }
+
   static Res runChild(long seed, String cfg, int maxN, long wdMs, String tag) throws Exception {
     String cmd = System.getenv("HUNTER_JAVA_CMD");
     if (cmd == null || !cmd.startsWith("java ")) throw new IllegalStateException("HUNTER_JAVA_CMD not set; use run-hunter.sh");
@@ -1888,8 +2421,7 @@ public final class Hunter {
     for (String f : flags(cfg).split(" ")) if (!f.isEmpty()) argv.add(f);
     argv.add("-Dhunter.wdMs=" + wdMs);
     if (maxN > 0) argv.add("-Dhunter.maxN=" + maxN);
-    for (String k : new String[] {"hunter.budgetMs", "hunter.iters", "hunter.minIters", "hunter.asyncMode", "hunter.stallDumpMs", "hunter.h6", "hunter.h4", "hunter.h7"})
-      if (System.getProperty(k) != null) argv.add("-D" + k + "=" + System.getProperty(k));
+    argv.addAll(passThrough());
     for (String a : cmd.substring(5).trim().split("\\s+")) argv.add(a);
     argv.add("--child");
     argv.add(Long.toString(seed));
@@ -1929,10 +2461,8 @@ public final class Hunter {
     for (String l : lines) {
       if (l.contains("ExceptionInInitializerError") || (l.contains("InfoDumper") && l.contains("Exception"))) infoDumper = true;
       if (l.contains("GraphInInvalidState constructed")) giis++;
-      if (l.contains("GraphInInvalidState") && !l.startsWith("\tat") && !l.startsWith("    at") && !l.startsWith("FINDING UNEXPECTED_EXCEPTION") && !l.contains("constructed - logging")) {
-        invalid = true;
-        if (invalidMsg == null) invalidMsg = l.trim();
-      }
+      // every GraphInInvalidState is logged at construction (MandatedExceptionLogger) followed by its trace
+      if (l.startsWith("optimus.graph.GraphInInvalidState") && invalidMsg == null) invalidMsg = l.trim();
       if (l.contains("Cannot complete node twice")) twice = true;
       if (l.contains("panic called") || l.contains("exiting (121)")) panic = true;
       if (l.startsWith("FINDING ")) {
@@ -1953,7 +2483,7 @@ public final class Hunter {
     if (!fk.isEmpty()) det.append(" findings=").append(String.join(",", fk));
     long expected = Long.parseLong(kv.getOrDefault("h6expectedGIIS", "0"));
     if (giis > expected) invalid = true;
-    if (giis > 0) det.append(" giis=").append(giis).append("(expected ").append(expected).append(')');
+    if (giis > 0) det.append(" giis=").append(giis).append("/expected:").append(expected);
     if (invalid) {
       if (invalidMsg == null) invalidMsg = "GraphInInvalidState constructed x" + giis;
       cls = cls.equals("PASS") ? "ASSERT" : cls + "+ASSERT";
@@ -1968,7 +2498,7 @@ public final class Hunter {
 
   static String h4brief(Map<String, String> k) {
     if (k.get("h4on") == null) return "h4=[n/a]";
-    long take = 0, stale = 0, same = 0, popped = 0, r9 = 0, unk = 0, alias = 0;
+    long take = 0, stale = 0, same = 0, popped = 0, r9 = 0, unk = 0, alias = 0, xs = 0;
     StringBuilder per = new StringBuilder();
     for (String p : new String[] {"wakeup", "findWork", "run"}) {
       take += Long.parseLong(k.getOrDefault("h4take." + p, "0"));
@@ -1979,10 +2509,11 @@ public final class Hunter {
       r9 += Long.parseLong(k.getOrDefault("h4r9AtTake." + p, "0"));
       unk += Long.parseLong(k.getOrDefault("h4unknown." + p, "0"));
       alias += Long.parseLong(k.getOrDefault("h4aliased." + p, "0"));
+      xs += Long.parseLong(k.getOrDefault("h4xsched." + p, "0"));
       per.append(p).append(':').append(st).append('/').append(k.getOrDefault("h4take." + p, "0")).append(',');
     }
     return "h4=[staleTake=" + stale + " sameDepth=" + same + " popped=" + popped + " r9AtTake=" + r9 + " selfWait=" + k.get("h4selfWait.wait") + "+" + k.get("h4selfWait.timer") + " waitCycle=" + k.get("h4waitCycle.timer")
-        + " aliased=" + alias + " unknown=" + unk + " stale/take=" + per.substring(0, per.length() - 1) + "]";
+        + " foreignStamp=" + alias + " xschedAlias=" + xs + " unknown=" + unk + " stale/take=" + per.substring(0, per.length() - 1) + "]";
   }
 
   static String resultLine(Res r) {
@@ -2101,6 +2632,38 @@ public final class Hunter {
         + " repro: probes/run-hunter.sh one " + r.seed + " " + r.cfg + " " + best + " 5";
   }
 
+  /** seeds x cfgs, no baseline/rerun/minimise; for the H6/H7/H9 modes (selected by -Dhunter.* knobs passed through). */
+  static void matrix(long first, int count, List<String> cfgs) throws Exception {
+    int par = Integer.parseInt(System.getenv().getOrDefault("HUNTER_PAR", "4"));
+    ExecutorService pool = Executors.newFixedThreadPool(par);
+    List<Future<Res>> fs = new ArrayList<>();
+    for (long sd = first; sd < first + count; sd++)
+      for (String cfg : cfgs) {
+        long seed = sd;
+        fs.add(pool.submit(() -> runChild(seed, cfg, 0, Long.getLong("hunter.wdMs", 10_000), System.getProperty("hunter.tag", ""))));
+      }
+    Map<String, Integer> byCls = new TreeMap<>();
+    Map<String, int[]> byCfg = new TreeMap<>();
+    for (Future<Res> f : fs) {
+      Res r = f.get();
+      System.out.println(resultLine(r) + (r.kv.get("h6expectedGIIS") != null ? " " + h6brief(r.kv) : "") + (r.kv.get("h7") != null ? " h7=[" + r.kv.get("h7") + "]" : ""));
+      System.out.flush();
+      byCls.merge(r.cls, 1, Integer::sum);
+      byCfg.computeIfAbsent(r.cfg, k -> new int[2])[failed(r) ? 1 : 0]++;
+    }
+    byCfg.forEach((k, v) -> System.out.println("SUMMARY cfg=" + k + " pass=" + v[0] + " fail=" + v[1]));
+    byCls.forEach((k, v) -> System.out.println("SUMMARY class=" + k + " runs=" + v));
+    pool.shutdown();
+  }
+
+  static String h6brief(Map<String, String> k) {
+    StringBuilder sb = new StringBuilder("h6=[");
+    for (H6.St x : H6.St.values()) sb.append(x).append(':').append(k.get("h6." + x)).append(' ');
+    sb.append("syncWaiter:").append(k.get("h6syncWaiter")).append(" early:").append(k.get("h6wfcnsEarly")).append(" inGraph:").append(k.get("h6inGraphWaits"))
+        .append(" guardGIIS:").append(k.get("h6expectedGIIS")).append(']');
+    return sb.toString();
+  }
+
   static void one(long seed, String cfg, int maxN, int reps) throws Exception {
     int fails = 0;
     for (int k = 0; k < reps; k++) {
@@ -2115,6 +2678,17 @@ public final class Hunter {
     if (args.length >= 4 && args[0].equals("--soak")) {
       try {
         soakChild(Long.parseLong(args[1]), args[2], Long.parseLong(args[3]));
+      } catch (Throwable t) {
+        System.out.println("CHILD-ERROR " + t);
+        t.printStackTrace(System.out);
+        System.out.flush();
+        Runtime.getRuntime().halt(4);
+      }
+      return;
+    }
+    if (args.length >= 2 && args[0].equals("--h8")) {
+      try {
+        h8Child(args[1]);
       } catch (Throwable t) {
         System.out.println("CHILD-ERROR " + t);
         t.printStackTrace(System.out);
@@ -2141,6 +2715,31 @@ public final class Hunter {
     if (args.length >= 3 && args[0].equals("sweep")) sweep(Long.parseLong(args[1]), Integer.parseInt(args[2]));
     else if (args.length >= 3 && args[0].equals("one"))
       one(Long.parseLong(args[1]), args[2], args.length > 3 ? Integer.parseInt(args[3]) : 0, args.length > 4 ? Integer.parseInt(args[4]) : 1);
+    else if (args.length >= 2 && args[0].equals("h8")) {
+      // h8 <variant>[@jvmflag,jvmflag...]...  e.g. deep:2000:amow@-Xss256k,-Doptimus.scheduler.syncStackSafetyLimit=10000
+      String cmd = System.getenv("HUNTER_JAVA_CMD");
+      for (int i = 1; i < args.length; i++) {
+        String[] vf = args[i].split("@", 2);
+        List<String> argv = new ArrayList<>(List.of("java"));
+        if (vf.length > 1) argv.addAll(Arrays.asList(vf[1].split(",")));
+        argv.addAll(passThrough());
+        for (String a : cmd.substring(5).trim().split("\\s+")) argv.add(a);
+        argv.addAll(List.of("--h8", vf[0]));
+        Path log = logDir().resolve("h8-" + args[i].replaceAll("[^A-Za-z0-9.=:-]", "_") + ".log");
+        long t0 = System.nanoTime();
+        Process p = new ProcessBuilder(argv).redirectErrorStream(true).redirectOutput(log.toFile()).start();
+        boolean fin = p.waitFor(180, TimeUnit.SECONDS);
+        if (!fin) p.destroyForcibly().waitFor();
+        List<String> lines = Files.readAllLines(log, java.nio.charset.StandardCharsets.ISO_8859_1);
+        Map<String, String> kv = kvs(lines);
+        String h8 = lines.stream().filter(l -> l.startsWith("H8 ") || l.startsWith("H8-HANG")).findFirst().orElse("");
+        long soe = lines.stream().filter(l -> l.contains("StackOverflowError")).count();
+        long giis = lines.stream().filter(l -> l.contains("GraphInInvalidState constructed")).count();
+        System.out.println("RESULT h8 " + args[i] + " exit=" + (fin ? p.exitValue() : -1) + " wallMs=" + (System.nanoTime() - t0) / 1_000_000 + " ms=" + kv.get("ms") + " clientThrew=" + kv.get("clientThrew")
+            + " rootDone=" + kv.get("rootDone") + " rootException=" + kv.get("rootException") + " soeLines=" + soe + " giis=" + giis + " h5viol=" + kv.get("violations") + " | " + h8 + " log=" + log.getFileName());
+      }
+    } else if (args.length >= 4 && args[0].equals("matrix"))
+      matrix(Long.parseLong(args[1]), Integer.parseInt(args[2]), Arrays.asList(args).subList(3, args.length));
     else if (args.length >= 4 && args[0].equals("soak"))
       soak(Long.parseLong(args[1]), Integer.parseInt(args[2]), Arrays.asList(args).subList(3, args.length));
     else if (args.length >= 2 && args[0].equals("inv")) {
@@ -2148,9 +2747,11 @@ public final class Hunter {
       String cmd = System.getenv("HUNTER_JAVA_CMD");
       for (int i = 1; i < args.length; i++) {
         List<String> argv = new ArrayList<>(List.of("java"));
-        boolean n2 = args[i].startsWith("n2:");
+        boolean n2 = args[i].startsWith("n2:"), u = args[i].startsWith("u:");
         String cfg = args[i].substring(args[i].indexOf(':') + 1);
         if (n2) argv.add("-Dinv.n2=true");
+        if (u) argv.add("-Dinv.u=true");
+        argv.addAll(passThrough());
         for (String f : flags(cfg).split(" ")) if (!f.isEmpty()) argv.add(f);
         for (String a : cmd.substring(5).trim().split("\\s+")) argv.add(a);
         argv.add("--inv");
@@ -2161,7 +2762,7 @@ public final class Hunter {
         List<String> lines = Files.readAllLines(log, java.nio.charset.StandardCharsets.ISO_8859_1);
         String hang = lines.stream().filter(l -> l.startsWith("INV-HANG")).findFirst().orElse("");
         boolean invalid = lines.stream().anyMatch(l -> l.contains("GraphInInvalidState"));
-        System.out.println("RESULT scenario=" + (n2 ? "N2" : "INV") + " cfg=" + cfg + " class=" + (!fin ? "HANG:unresponsive" : p.exitValue() == 3 ? (n2 ? "HANG:causality-stall(N2)" : "HANG:sync-stack-inversion(N3)") : p.exitValue() == 0 ? "PASS" : "CRASH(" + p.exitValue() + ")")
+        System.out.println("RESULT scenario=" + (n2 ? "N2" : u ? "U" : "INV") + " cfg=" + cfg + " class=" + (!fin ? "HANG:unresponsive" : p.exitValue() == 3 ? (n2 ? "HANG:causality-stall(N2)" : u ? "HANG:sync-stack-inversion(U, unstamped)" : "HANG:sync-stack-inversion(N3)") : p.exitValue() == 0 ? "PASS" : "CRASH(" + p.exitValue() + ")")
             + (invalid ? "+ASSERT" : "") + " " + hang + " " + h4brief(kvs(lines)) + " log=" + log.getFileName());
       }
     } else if (args.length >= 2 && args[0].equals("spec")) {
@@ -2254,9 +2855,10 @@ final class HunterHooks {
  */
 final class HunterH4 {
   static final boolean ON = !"false".equals(System.getProperty("hunter.h4"));
+  static final boolean RING = Boolean.getBoolean("hunter.h4ring");
   static final java.lang.invoke.VarHandle STAMP, EPOCHS, CUR, CTX;
   static final AtomicLong SEQ = new AtomicLong();
-  static final java.util.concurrent.ConcurrentHashMap<Integer, OGSchedulerContext> byTid = new java.util.concurrent.ConcurrentHashMap<>();
+  static final java.util.concurrent.ConcurrentHashMap<Long, OGSchedulerContext> byTid = new java.util.concurrent.ConcurrentHashMap<>();
   static final java.util.concurrent.ConcurrentHashMap<String, AtomicLong> counts = new java.util.concurrent.ConcurrentHashMap<>();
   static final java.util.concurrent.ConcurrentHashMap<OGSchedulerContext, NodeTask> lastSelfWait = new java.util.concurrent.ConcurrentHashMap<>();
   static final AtomicInteger printed = new AtomicInteger();
@@ -2266,6 +2868,8 @@ final class HunterH4 {
   static final class Stamp {
     final int tid, c;
     final long[] ep;
+    volatile String pushed; // last queue push (H4 provenance)
+    OGSchedulerContext by; // the stamping thread's context (thread ids are per scheduler: they collide across schedulers)
     // last take checked against this stamp: path, taker tid@causality, taker frame at that level, verdict
     volatile String takePath, verdict;
     volatile int takeTid, takeC;
@@ -2321,6 +2925,15 @@ final class HunterH4 {
     lastSelfWait.keySet().removeIf(sc -> !byTid.containsValue(sc));
   }
 
+  static long key(Scheduler s, int tid) {
+    int sid = 0;
+    try {
+      sid = Hunter.F_SID.getInt(s);
+    } catch (Exception ignored) {
+    }
+    return ((long) sid << 32) | (tid & 0xFFFFFFFFL);
+  }
+
   static OGScheduler.Context ctxOf(OGSchedulerContext sc) {
     return (OGScheduler.Context) CTX.get(sc);
   }
@@ -2330,7 +2943,7 @@ final class HunterH4 {
     if (ep == null) {
       ep = new long[64];
       EPOCHS.set(sc, ep);
-      byTid.put(ctxOf(sc).threadID, sc);
+      byTid.put(key(sc.scheduler(), ctxOf(sc).threadID), sc);
     }
     return ep;
   }
@@ -2355,7 +2968,8 @@ final class HunterH4 {
       STAMP.set(t, null);
       return;
     }
-    OGSchedulerContext sc = byTid.get(tid);
+    OGSchedulerContext cur = OGSchedulerContext.current();
+    OGSchedulerContext sc = cur != null && ctxOf(cur) != null && ctxOf(cur).threadID == tid ? cur : cur == null ? null : byTid.get(key(cur.scheduler(), tid));
     if (sc == null) {
       STAMP.set(t, new Stamp(tid, c, null));
       return;
@@ -2363,6 +2977,7 @@ final class HunterH4 {
     long[] ep = epochs(sc);
     if (ep[0] < c) inc("stampAboveDepth"); // stamped with a causality the thread is not at (chain upgrade by another thread?)
     Stamp ns = new Stamp(tid, c, java.util.Arrays.copyOf(ep, Math.min(ep.length, c + 1)));
+    ns.by = sc;
     if (STAMP.get(t) instanceof Stamp old && old.takePath != null && old.takePath.indexOf('(') < 0) { // keep how this node got here (the take that preceded this run)
       ns.takePath = old.takePath + "(prev stamp " + old.tid + "/" + old.c + " frame=" + (old.ep != null && old.ep.length > old.c ? old.ep[old.c] : -1) + ")";
       ns.takeTid = old.takeTid;
@@ -2370,7 +2985,23 @@ final class HunterH4 {
       ns.takeFrame = old.takeFrame;
       ns.verdict = old.verdict;
     }
+    if (STAMP.get(t) instanceof Stamp old2) ns.pushed = old2.pushed;
     STAMP.set(t, ns);
+  }
+
+  /** Before WorkQueue.localPush in OGSchedulerContext.enqueue / OGScheduler.enqueue: who queued this task, from which frame. */
+  public static void pushed(NodeTask t, String where) {
+    if (!ok || t == null) return;
+    OGSchedulerContext sc = OGSchedulerContext.current();
+    String by = Thread.currentThread().getName();
+    if (sc != null && ctxOf(sc) != null) {
+      long[] ep = epochs(sc);
+      by += "@" + ep[0] + " frame=" + ep[(int) ep[0]];
+    }
+    Object o = STAMP.get(t);
+    Stamp st = o instanceof Stamp x ? x : new Stamp(0, 0, null);
+    st.pushed = where + " by " + by;
+    if (!(o instanceof Stamp)) STAMP.set(t, st);
   }
 
   /** tryWakeupThread, after awaitedTask is set (hand-out succeeded). */
@@ -2395,15 +3026,27 @@ final class HunterH4 {
     check(t, sc, ctxOf(sc).threadID, c, "run");
   }
 
+  /** Per-context ring of recent take events (frame epoch, path, task, stamp), printed with a SELF_WAIT. */
+  static final java.util.concurrent.ConcurrentHashMap<OGSchedulerContext, String[]> rings = new java.util.concurrent.ConcurrentHashMap<>();
+  static final java.util.concurrent.ConcurrentHashMap<OGSchedulerContext, AtomicInteger> ringPos = new java.util.concurrent.ConcurrentHashMap<>();
+
+  static void ring(OGSchedulerContext sc, long frame, String path, NodeTask t) {
+    String[] r = rings.computeIfAbsent(sc, x -> new String[128]);
+    int i = ringPos.computeIfAbsent(sc, x -> new AtomicInteger()).getAndIncrement();
+    r[i & 127] = "frame=" + frame + " " + path + " " + t + " stamp=" + t.causalityThreadID() + "/" + t.causalityID() + " by " + Thread.currentThread().getName();
+  }
+
   static void check(NodeTask t, OGSchedulerContext sc, int tid, int c, String path) {
     if (c == 0 || sc == null) return;
     inc("take." + path);
+    if (RING) ring(sc, epochs(sc)[c], path, t);
     int ttid = t.causalityThreadID(), tc = t.causalityID();
     if (ttid == 0 && tc == 0) {
       // canTake: "task is compatible with every scheduler if it has no causality information". Record the take: an
       // unstamped node run inside an unrelated sync frame is the other way into the R9 end state (seed 14).
       inc("unstamped." + path);
       Stamp u = new Stamp(0, 0, null);
+      if (STAMP.get(t) instanceof Stamp o0) u.pushed = o0.pushed;
       u.takePath = keepPath(STAMP.get(t), path, tid);
       u.takeTid = tid;
       u.takeC = c;
@@ -2424,6 +3067,17 @@ final class HunterH4 {
     if (s.tid != tid) {
       inc("aliased." + path); // canTake accepted another thread's stamp (R1 aliasing)
       report("ALIASED_TAKE", t, sc, tid, c, s, path);
+      return;
+    }
+    if (s.by != null && s.by != sc) {
+      // same numeric id, different thread: another scheduler's thread stamped it (per-scheduler threadCounter)
+      inc("crossSchedAlias." + path);
+      s.takePath = keepPath(s, path, tid);
+      s.takeTid = tid;
+      s.takeC = c;
+      s.takeFrame = epochs(sc)[c];
+      s.verdict = "XSCHED_ALIAS(stamped by " + (ctxOf(s.by).thread == null ? "?" : ctxOf(s.by).thread.getName()) + ")";
+      report("CROSS_SCHEDULER_ALIAS", t, sc, tid, c, s, path);
       return;
     }
     long[] cur = epochs(sc);
@@ -2473,7 +3127,7 @@ final class HunterH4 {
     Object o = STAMP == null ? null : STAMP.get(n);
     if (!(o instanceof Stamp s)) return n + "[stamp " + n.causalityThreadID() + "/" + n.causalityID() + " unrecorded]";
     return n + "[stamp " + s.tid + "/" + s.c + " frame=" + (s.ep != null && s.ep.length > s.c ? s.ep[s.c] : -1) + " lastTake=" + s.takePath + " by " + s.takeTid + "@" + s.takeC
-        + " takerFrame=" + s.takeFrame + " " + s.verdict + "]";
+        + " takerFrame=" + s.takeFrame + " " + s.verdict + " pushed=" + s.pushed + "]";
   }
 
   static void report(String what, NodeTask t, OGSchedulerContext sc, int tid, int c, Stamp s, String path) {
@@ -2552,6 +3206,11 @@ final class HunterH4 {
       long[] ep = epochs(sc);
       StringBuilder fr = new StringBuilder("H4 SELF_WAIT frames (index: node, causality-level epochs " + java.util.Arrays.toString(java.util.Arrays.copyOf(ep, (int) Math.min(ep.length, ep[0] + 1))) + "):");
       for (var e : new java.util.TreeMap<Integer, NodeTask>(invert(stack)).entrySet()) fr.append("\n   ").append(e.getKey()).append(": ").append(stampInfo(e.getValue()));
+      if (RING) {
+        String[] r = rings.get(sc);
+        int pos = ringPos.get(sc) == null ? 0 : ringPos.get(sc).get();
+        if (r != null) for (int k = Math.max(0, pos - 128); k < pos; k++) if (r[k & 127] != null) fr.append("\n   take ").append(r[k & 127]);
+      }
       fr.append("\n   awaited path:");
       for (NodeTask y : p) fr.append(" -> ").append(stampInfo(y));
       System.out.println(fr);
@@ -2624,7 +3283,7 @@ final class HunterH4 {
           .append(" h4sameDepth.").append(p).append('=').append(get("staleSameDepth." + p)).append(" h4popped.").append(p).append('=').append(get("popped." + p))
           .append(" h4unstamped.").append(p).append('=').append(get("unstamped." + p))
           .append(" h4r9AtTake.").append(p).append('=').append(get("r9AtTake." + p)).append(" h4unknown.").append(p).append('=').append(get("unknownStamp." + p))
-          .append(" h4aliased.").append(p).append('=').append(get("aliased." + p)).append(" h4direct.").append(p).append('=').append(get("direct." + p));
+          .append(" h4aliased.").append(p).append('=').append(get("aliased." + p)).append(" h4xsched.").append(p).append('=').append(get("crossSchedAlias." + p)).append(" h4direct.").append(p).append('=').append(get("direct." + p));
     sb.append(" h4selfWait.wait=").append(get("selfWait.wait")).append(" h4selfWait.timer=").append(get("selfWait.timer")).append(" h4waitCycle.timer=").append(get("waitCycle.timer"))
         .append(" h4waits=").append(get("waits.wait")).append(" h4runs=").append(get("runs")).append(" h4stampAboveDepth=").append(get("stampAboveDepth"))
         .append(" h4on=").append(ok);
@@ -2770,6 +3429,12 @@ final class HunterAgent {
                     h4("beforeWait", "(Loptimus/graph/OGSchedulerContext;Loptimus/graph/NodeTask;Ljava/lang/String;)V");
                     hook("c.wait");
                   }
+                }
+                if (name.equals("localPush") && owner.equals("optimus/graph/OGSchedulerContext$WorkQueue")
+                    && ((cname.equals("optimus/graph/OGSchedulerContext") && m.equals("enqueue")) || (cname.equals("optimus/graph/OGScheduler") && m.equals("enqueue")))) {
+                  super.visitInsn(Opcodes.DUP); // the task argument of localPush
+                  super.visitLdcInsn(cname.endsWith("Context") ? "localPush" : "globalPush");
+                  h4("pushed", "(Loptimus/graph/NodeTask;Ljava/lang/String;)V");
                 }
                 if (cname.equals("optimus/graph/OGSchedulerContext") && m.equals("run") && name.equals("setCausality")) {
                   super.visitVarInsn(Opcodes.ALOAD, 0);

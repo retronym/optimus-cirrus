@@ -158,7 +158,8 @@ A 24 h run of H3 scenarios in a loop on a 4-core box with `threadCounter` and `_
 - H1/H2 model checking: done (`probes/modelcheck/`). WorkQueue: no loss anywhere, R7 double hand-outs quantified. Waiters: protocol holds. New R8 from H2e: `markAsRunnable` vs `complete` leaves a done node runnable (forbidden 2% of samples). Lincheck cannot instrument the agent-rewritten `NodeTask`.
 - H3/H5 fuzzer: done (`probes/run-hunter.sh`, `probes/RESULTS-hunter.txt`). 632 runs, no lost wakeup, no accounting violation, no wrong value. Two new high findings with deterministic reproducers: R9 (stale causality stamp lets a thread deadlock on its own sync stack) and R10 (`limitThreads` starvation of global work no waiter may take, organic triggers). Seed 20 NOT_DONE is open.
 - Tier 1 T3–T6, T9–T12: done (`probes/run-tier1b.sh`, `probes/RESULTS-tier1b.txt`). T4 deadlock demonstrated (R4 → M), T9 demonstrated plus new F3b (phantom worker after a failed thread start), T10 refutes F4 and widens R9 to unstamped external work, T3/T5/T11/T12 quantified.
-- Remaining: H4, H6–H10 (in progress). Fix candidates worth prototyping first: R9, R10, R1, R4, R8, F1b/F2b/F3b.
+- Tier 2 H4, H6–H10: done (`probes/RESULTS-hunter2.txt`). H4 oracle (SELF_WAIT) catches every R9 hang before the park with no false positives; H6 found R10b and R11; H7 found nothing beyond R9/R10 plus one unexplained hang (seed 24, K=4); H8 added a stack-overflow kill-path case under F1; H9 ran under virtual threads (loom-on agent with a stubbed `vt_helpers.sc`) and confirmed the R9/R10 predictions; H10 (60 min) showed no drift and no new class.
+- Campaign complete. Open: seed 20 NOT_DONE (twice in ~1,000 runs), H7 seed 24. Fix candidates worth prototyping first: R9 (incl. unstamped delivery), R10/R10b, R1, R4, R8, R11, F1b/F2b/F3b.
 
 ## Open questions
 
