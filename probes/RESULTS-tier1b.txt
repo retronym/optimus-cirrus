@@ -1,0 +1,174 @@
+Tier 1 probes T3, T4, T5, T6, T9, T10, T11, T12 (TEST_CAMPAIGN.md), real OGScheduler end to end, one child JVM per configuration.
+
+Command:   probes/run-tier1b.sh [T3 T4 T5 T6 T9 T10 T11 T12]       (about 4 minutes; per-child logs in $TIER1B_LOGDIR, default scratchpad/tier1b)
+Child JVM: java <flags> $(probes/run-tier1b.sh --print-cmd | cut -c6-) --child <probe> <variant>
+           = java -XX:+UseSerialGC -javaagent:entityagent.jar -javaagent:classes-tier1b/tier1bagent.jar <add-exports/opens> -Doptimus.graph.async.profiler=false -cp classes-tier1b:<build cp> optimus.graph.Tier1b --child ...
+Sources:   probes/src/optimus/graph/Tier1b.java (probes + Tier1bAgent, an ASM agent that hooks optimus.core.IndexedArrayList.foreach; hooks are inert for every list except OGScheduler._evalAsyncTrackedNodes)
+
+Key observations
+- T3 (R3) QUANTIFIED. No exception, panic or hang in 15,791 stalled findWork passes over _evalAsyncTrackedNodes against 15.8 M concurrent enqueueAndTrackCompletion adds (8 non-graph threads) and 7.4 M removals from non-graph completer threads. foreach cannot throw (it breaks on the first null). It does skip: long-lived "sentinel" tracked nodes that were in the list for the whole pass (added before the pass entered, not yet completed after it, and still in the array after the pass) were not visited in 8,370 of 494,892 checks (1.7%) without delay, 28% with a 0-50 us park per element inside foreach (-Dprobes.delay.maxNanos=50000), 0.2% at ideal=2. One double visit in 6.5 M. So cycle detection on tracked nodes is silently incomplete on a stall pass; it is only made up for by the next stall.
+- T4 (R4) DEMONSTRATED, permanent JVM-level deadlock on the first cross-scheduler recovery, even with no injected delay. Two OGSchedulers, keepTaskSchedulerAffinity=true, a two-node waitingOn cycle on each, a NodeTask whose tryToRecoverFromCycle enqueues a Leaf onto the other scheduler and returns true. findDeadlockedThreads reports both clients: one in OGScheduler.enqueue (BLOCKED on the other scheduler's OGSLock) <- tryToRecoverFromCycle <- detectCyclesAndRecover <- findWorkOnForwardChain:1293 holding its own OGSLock and NodeTask._visitLock; the other in detectCyclesAndRecover:1944 waiting for _visitLock while holding its own OGSLock. Control (only one scheduler has a cycle): 50 rounds, 2,000 cross enqueues, no deadlock.
+- T5 (R5) QUANTIFIED. waitForCancelledNodesToStop returns as soon as the node stops in every configuration (no hoisting, also with -XX:-UseOnStackReplacement -Xcomp; Thread.yield keeps the loop honest). It burns the waiting thread for the duration: busy node, 2.0 s wait, 1.0-1.6 s CPU (mostly sys: yield); cancelled node sync-waiting a 100,000-long forward chain, 1.96 s wait, 1.89-1.99 s CPU (user), each poll iteration's visitForwardChain().containsEQ costs 3.0-4.6 ms.
+- T6 (R6) DEMONSTRATED (mechanism end to end; no functional disturbance). Without a nudge, invalidateCache on the node T sync-waits does NOT release T: it stays parked (3 s observed) until A completes, so the frame is never reused stale. With any global enqueue after the invalidate (the waiter scan hands the task to T), T exits runAndWait in 6-7 ms with its SyncFrame still on A's waiter list; the next sync wait reuses the same SyncFrame object (frames[1], ntsk=RB, waitingOn=B); A's later completion runs notifyWaiters on it and clears its waitingOn (B -> null) while T is still waiting on B. T is not woken (awakeOnComplete compares awaitedTask), B's wait returns 0-1 ms after B completes, no GraphInInvalidState with asserts on. frame.waitingOn is not read by the scheduler, so the clobber is invisible today.
+- T9 (F3) DEMONSTRATED. 10,000 calls -> 10,001 og.worker threads (ideal 18 or 2), all simultaneously alive, no OOM at -Xss512k -Xmx256m; after release the pool shrinks to idlePoolCount (36 resp. 4). At 15,000 calls the OS limit (kern.num_taskthreads 12288) is hit: OutOfMemoryError "unable to create native thread" thrown to the caller after 12,268 threads. New: the failed injectThread leaves its Context (thread=null, userEntry, awaitedTask = a node that never runs) in _workers forever. _workers.count never reaches 0, so (a) onGraphStalled callbacks never fire again (a client waiting on a node only a stall callback completes hangs; control fires), and (b) a spinner thread stays in _workers spinning at 0.76 CPU-s per second indefinitely.
+- T10 (F4) NOT_REPRODUCED, W6b confirmed end to end. Nodes enqueued through asIfRunning carry causality 0/0 (never 1/x), both inside the supplier and after it returns; thread id 1 (the first injected worker of a fresh scheduler, at sync depth 4, awaitedCausality 2) runs the node and stamps it 1/2 itself. Making that node sync-wait L, which is lower on thread 1's sync stack, deadlocks permanently, and identically with an emulated asIfRunning using a fresh id 30001: the cause is that enqueue's waiter scan gives an unstamped (0/0) external node to a waiter at causality 2 (same delivery path as R9), not the id collision.
+- T11 (I1) QUANTIFIED. Plain-loop benchmark, 20,000 iterations after 5,000 warm-up, completer hands off when the client sets parked. Median blocking sync get 3.1 us (cheap node, shallow) to 7.5 us (20-arg node at stack depth 205); toString 0.13 us cheap / 0.5 us for a 333-char 20-arg render, new Exception 0.29 us at depth 5 / 2.75-3.25 us at depth 205, so the two unconditional allocations are 13% of the fastest wait and 42-44% at depth 205; end to end the deep, expensive case costs +4.3 us per wait. With a 50 us handoff (client truly parks, median 62-66 us) the share is 1% shallow, 6% at depth 205.
+- T12 (I2) QUANTIFIED (threshold not met). ideal=4, one 5 s busy node, nothing else runnable: the spinner og.worker-1-3 burned 4.17 s CPU (median 91% per 100 ms sample, 33/49 samples >= 80%) when a client thread runs the node, 3.31 s (median 68%, 0 samples >= 80%) when an og worker runs it. Most of a core for the node's duration, but below the ">= 80% for the duration" criterion.
+
+Raw output of the run:
+
+RESULT T3 QUANTIFIED no exception in 15791 stalled passes over _evalAsyncTrackedNodes x 15778731 enqueueAndTrackCompletion adds; 58734 of 7105320 (sentinel, pass) pairs where the sentinel was tracked for the whole pass were skipped by the iteration;
+  [vol -Doptimus.gthread.ideal=1] exit=0 passes=1372 points=549428 adds=4005074 (sentinels 250318, ext-completed leaves 1877897) clientWaits=3752 sentinelChecks=494892 skipped=8370 (still tracked after the pass: 8370) doubled=0 concurrentIter=0 maxLen=513 errors=0 exceptionLines=0 agent=ok
+    | T3 first skip: pass 1: T3Sentinel added@2552 pass entered@2736 listCount=225
+  [delay -Doptimus.gthread.ideal=1 -Dprobes.delay.maxNanos=50000] exit=0 passes=409 points=68868 adds=3067833 (sentinels 191740, ext-completed leaves 1437907) clientWaits=2764 sentinelChecks=64435 skipped=17950 (still tracked after the pass: 17950) doubled=0 concurrentIter=0 maxLen=220 errors=0 exceptionLines=0 agent=ok
+    | T3 first skip: pass 1: T3Sentinel added@1737 pass entered@1975 listCount=120
+  [delay-asserts -Doptimus.gthread.ideal=1 -Dprobes.delay.maxNanos=50000 -Doptimus.scheduler.asserts=true] exit=0 passes=409 points=69031 adds=3064760 (sentinels 191548, ext-completed leaves 1436050) clientWaits=2711 sentinelChecks=64574 skipped=18306 (still tracked after the pass: 18306) doubled=0 concurrentIter=0 maxLen=219 errors=0 exceptionLines=0 agent=ok
+    | T3 first skip: pass 1: T3Sentinel added@1423 pass entered@1824 listCount=139
+  [vol-ideal2 -Doptimus.gthread.ideal=2] exit=0 passes=13601 points=6627260 adds=5641064 (sentinels 352567, ext-completed leaves 2644432) clientWaits=3866 sentinelChecks=6481419 skipped=14108 (still tracked after the pass: 14098) doubled=1 concurrentIter=0 maxLen=517 errors=0 exceptionLines=0 agent=ok
+    | T3 first skip: pass 1: T3Sentinel added@967 pass entered@1371 listCount=267
+RESULT T4 DEMONSTRATED 
+  [delayMs:maxRecoveriesPerNode:rounds=0:20:50:solo -Doptimus.graph.keepTaskSchedulerAffinity=true ] exit=0 completed finished=50 circular=50 recoveries=3150 crossEnqueues=2000 crossEnqueuesReturned=2000 deadlockedThreads=null by={t4-client-A=3149,_og.worker-2-t4A-2=1}
+    | T4-RECOVER k=1 node=PA0 thread=t4-client-A heldVisitLock=true eq=OGScheduler -> enqueued onto the other scheduler (t4B)
+    | T4-RECOVER k=2 node=PA0 thread=t4-client-A heldVisitLock=true eq=OGScheduler -> enqueued onto the other scheduler (t4B)
+  [delayMs:maxRecoveriesPerNode:rounds=50:3:3 -Doptimus.graph.keepTaskSchedulerAffinity=true ] exit=3 HANG finished=0 circular=null recoveries=1 crossEnqueues=1 crossEnqueuesReturned=0 deadlockedThreads=2 by={t4-client-B=1}
+    | ---- findDeadlockedThreads: 2 threads [28, 29]
+    | --- "t4-client-A" id=28 WAITING waiting on java.util.concurrent.locks.ReentrantLock$NonfairSync@c3c4c1c owned by "t4-client-B"
+    | at app//optimus.graph.NodeTask.detectCyclesAndRecover(NodeTask.java:1944)
+    | at app//optimus.graph.OGScheduler.findWorkOnForwardChain(OGScheduler.java:1293)
+    | - locked optimus.graph.OGScheduler$OGSLock@27e32fe4
+    | --- "t4-client-B" id=29 BLOCKED waiting on optimus.graph.OGScheduler$OGSLock@27e32fe4 owned by "t4-client-A"
+    | at app//optimus.graph.OGScheduler.enqueue(OGScheduler.java:576)
+    | at app//optimus.graph.Tier1b$CycNode.tryToRecoverFromCycle(Tier1b.java:608)
+    | at app//optimus.graph.NodeTask.detectCyclesAndRecover(NodeTask.java:1972)
+    | at app//optimus.graph.OGScheduler.findWorkOnForwardChain(OGScheduler.java:1293)
+    | - locked optimus.graph.OGScheduler$OGSLock@17d238b1
+    | holds synchronizer java.util.concurrent.locks.ReentrantLock$NonfairSync@c3c4c1c
+  [delayMs:maxRecoveriesPerNode:rounds=0:20:300 -Doptimus.graph.keepTaskSchedulerAffinity=true ] exit=3 HANG finished=0 circular=null recoveries=1 crossEnqueues=1 crossEnqueuesReturned=0 deadlockedThreads=2 by={t4-client-B=1}
+    | ---- findDeadlockedThreads: 2 threads [28, 29]
+    | --- "t4-client-A" id=28 WAITING waiting on java.util.concurrent.locks.ReentrantLock$NonfairSync@c3c4c1c owned by "t4-client-B"
+    | at app//optimus.graph.NodeTask.detectCyclesAndRecover(NodeTask.java:1944)
+    | at app//optimus.graph.OGScheduler.findWorkOnForwardChain(OGScheduler.java:1293)
+    | - locked optimus.graph.OGScheduler$OGSLock@27e32fe4
+    | --- "t4-client-B" id=29 BLOCKED waiting on optimus.graph.OGScheduler$OGSLock@27e32fe4 owned by "t4-client-A"
+    | at app//optimus.graph.OGScheduler.enqueue(OGScheduler.java:576)
+    | at app//optimus.graph.Tier1b$CycNode.tryToRecoverFromCycle(Tier1b.java:608)
+    | at app//optimus.graph.NodeTask.detectCyclesAndRecover(NodeTask.java:1972)
+    | at app//optimus.graph.OGScheduler.findWorkOnForwardChain(OGScheduler.java:1293)
+    | - locked optimus.graph.OGScheduler$OGSLock@17d238b1
+    | holds synchronizer java.util.concurrent.locks.ReentrantLock$NonfairSync@c3c4c1c
+  [delayMs:maxRecoveriesPerNode:rounds=0:20:300 -Doptimus.graph.keepTaskSchedulerAffinity=true -Doptimus.scheduler.asserts=true] exit=3 HANG finished=0 circular=null recoveries=1 crossEnqueues=1 crossEnqueuesReturned=0 deadlockedThreads=2 by={t4-client-A=1}
+    | ---- findDeadlockedThreads: 2 threads [28, 29]
+    | --- "t4-client-A" id=28 BLOCKED waiting on optimus.graph.OGScheduler$OGSLock@17d238b1 owned by "t4-client-B"
+    | at app//optimus.graph.OGScheduler.enqueue(OGScheduler.java:576)
+    | at app//optimus.graph.Tier1b$CycNode.tryToRecoverFromCycle(Tier1b.java:608)
+    | at app//optimus.graph.NodeTask.detectCyclesAndRecover(NodeTask.java:1972)
+    | at app//optimus.graph.OGScheduler.findWorkOnForwardChain(OGScheduler.java:1293)
+    | - locked optimus.graph.OGScheduler$OGSLock@27e32fe4
+    | holds synchronizer java.util.concurrent.locks.ReentrantLock$NonfairSync@c3c4c1c
+    | --- "t4-client-B" id=29 WAITING waiting on java.util.concurrent.locks.ReentrantLock$NonfairSync@c3c4c1c owned by "t4-client-A"
+    | at app//optimus.graph.NodeTask.detectCyclesAndRecover(NodeTask.java:1944)
+    | at app//optimus.graph.OGScheduler.findWorkOnForwardChain(OGScheduler.java:1293)
+    | - locked optimus.graph.OGScheduler$OGSLock@17d238b1
+RESULT T5 QUANTIFIED 
+  [busy default JIT] exit=0 wait=1999ms waiterCPU=1558ms (user 785ms) nodeRemainingAtCall=1999ms nodeRun=2000ms chainBuild=0ms chainWalkPerIter=-1.0us childWall=2s
+  [chain:100000 default JIT] exit=0 wait=1958ms waiterCPU=1887ms (user 1841ms) nodeRemainingAtCall=1958ms nodeRun=2031ms chainBuild=11ms chainWalkPerIter=3037.7us childWall=2s
+  [busy -XX:-UseOnStackReplacement -Xcomp] exit=0 wait=1998ms waiterCPU=1455ms (user 634ms) nodeRemainingAtCall=1992ms nodeRun=2000ms chainBuild=0ms chainWalkPerIter=-1.0us childWall=11s
+  [chain:100000 -XX:-UseOnStackReplacement -Xcomp] exit=0 wait=2029ms waiterCPU=1992ms (user 1962ms) nodeRemainingAtCall=2029ms nodeRun=2146ms chainBuild=49ms chainWalkPerIter=3118.4us childWall=12s
+RESULT T6 DEMONSTRATED 
+  [nonudge asserts=false] exit=0 exitedOnInvalidate=false (after 3004ms) A completed beforeB(to_release_T); second wait reuses frame=true; A's late notification cleared the reused frame's waitingOn(B)=false; T woken early / B's wait disturbed=false; T returned 0ms after B completed; T errors=0; frame1.waitingOn after B done=null
+    | T6 before invalidate: frame1.ntsk=RA frame1.waitingOn=A A._waiters=theFrame
+    | T6 after invalidate: A=SRi#: isDoneEx=true A._waiters=theFrame T.parked=true
+    | T6 RA saw: SRCi#: isDone=true isDoneEx=true
+    | T6 second wait: sameFrameObject=true frame1.ntsk=RB frame1.waitingOn=B A._waiters=Object B._waiters=theFrame T.awaitedTask=B
+    | T6 after A completes: n/a
+  [nudge asserts=false] exit=0 exitedOnInvalidate=true (after 7ms) A completed duringB; second wait reuses frame=true; A's late notification cleared the reused frame's waitingOn(B)=true; T woken early / B's wait disturbed=false; T returned 1ms after B completed; T errors=0; frame1.waitingOn after B done=null
+    | T6 before invalidate: frame1.ntsk=RA frame1.waitingOn=A A._waiters=theFrame
+    | T6 after invalidate: A=SRi#: isDoneEx=true A._waiters=theFrame T.parked=true
+    | T6 RA saw: SRi#: isDone=false isDoneEx=true
+    | T6 second wait: sameFrameObject=true frame1.ntsk=RB frame1.waitingOn=B A._waiters=theFrame B._waiters=theFrame T.awaitedTask=B
+    | T6 after A completes: completeThrew=null A=SRCi#: frame1.ntsk=RB frame1.waitingOn=null T.parked=true T.awaitedTask=B T.returnedFromB=false B.done=false
+  [nonudge asserts=true] exit=0 exitedOnInvalidate=false (after 3004ms) A completed beforeB(to_release_T); second wait reuses frame=true; A's late notification cleared the reused frame's waitingOn(B)=false; T woken early / B's wait disturbed=false; T returned 0ms after B completed; T errors=0; frame1.waitingOn after B done=null
+    | T6 before invalidate: frame1.ntsk=RA frame1.waitingOn=A A._waiters=theFrame
+    | T6 after invalidate: A=SRi#: isDoneEx=true A._waiters=theFrame T.parked=true
+    | T6 RA saw: SRCi#: isDone=true isDoneEx=true
+    | T6 second wait: sameFrameObject=true frame1.ntsk=RB frame1.waitingOn=B A._waiters=Object B._waiters=theFrame T.awaitedTask=B
+    | T6 after A completes: n/a
+  [nudge asserts=true] exit=0 exitedOnInvalidate=true (after 6ms) A completed duringB; second wait reuses frame=true; A's late notification cleared the reused frame's waitingOn(B)=true; T woken early / B's wait disturbed=false; T returned 0ms after B completed; T errors=0; frame1.waitingOn after B done=null
+    | T6 before invalidate: frame1.ntsk=RA frame1.waitingOn=A A._waiters=theFrame
+    | T6 after invalidate: A=SRi#: isDoneEx=true A._waiters=theFrame T.parked=true
+    | T6 RA saw: SRi#: isDone=false isDoneEx=true
+    | T6 second wait: sameFrameObject=true frame1.ntsk=RB frame1.waitingOn=B A._waiters=theFrame B._waiters=theFrame T.awaitedTask=B
+    | T6 after A completes: completeThrew=null A=SRCi#: frame1.ntsk=RB frame1.waitingOn=null T.parked=true T.awaitedTask=B T.returnedFromB=false B.done=false
+RESULT T9 DEMONSTRATED 
+  [10000 calls, -Xss512k -Xmx256m] exit=0 ideal=18 idlePoolCount=36 submitted=10000 in 1584ms failure=none nodesRunning=10000 og.worker threads while blocked=10001 peak JVM threads=10010 (baseline 8) _workers.count=10001; after release: allDone=true done=10000 og.worker threads after 3 s=36, after 8 s=36, idlePool=36, _workers.count=0 [-], scheduler usable afterwards: sync get=true, get completed only by onGraphStalled=true
+  [10000 calls, -Xss512k -Xmx256m -Doptimus.gthread.ideal=2] exit=0 ideal=2 idlePoolCount=4 submitted=10000 in 1471ms failure=none nodesRunning=10000 og.worker threads while blocked=10001 peak JVM threads=10010 (baseline 8) _workers.count=10001; after release: allDone=true done=10000 og.worker threads after 3 s=4, after 8 s=4, idlePool=4, _workers.count=0 [-], scheduler usable afterwards: sync get=true, get completed only by onGraphStalled=true
+  [15000 calls, -Xss512k -Xmx256m -Doptimus.gthread.ideal=2] exit=0 ideal=2 idlePoolCount=4 submitted=12268 in 2463ms failure=java.lang.OutOfMemoryError:_unable_to_create_native_thread:_possibly_out_of_memory_or_process/resource_limits_reached nodesRunning=12268 og.worker threads while blocked=12269 peak JVM threads=12278 (baseline 8) _workers.count=12270; after release: allDone=true done=12268 og.worker threads after 3 s=5, after 8 s=5, idlePool=4, _workers.count=2 [noThread#12271(user)(awaits_LatchNode_never-run),[cpu_760ms/s_spinning=true]og.worker-1-3#3,], scheduler usable afterwards: sync get=true, get completed only by onGraphStalled=false
+RESULT T10 NOT_REPRODUCED 
+  [stamp] exit=0 completed eStampAtEnqueue=0/0_(asIfRunning_ctx_id=1) eStampAfterHost=0/0 eRanOnThread1=true
+    | T10 thread1=og.worker-2-t10-1 id=1 awaited=W awaitedCausality=2 syncDepth=4
+    | T10 W stamp=1/2 on tid=1
+    | T10 E stamp in asIfRunning after enqueue: 0/0 (asIfRunning ctx id=1); after host returned: 0/0; at run: ranOn=og.worker-2-t10-1 tid=1 stamp=1/2 ecCausality=2 syncDepth=4
+    | T10 at end: thread1.awaited=null parked=true syncStack= > [start]:SRCi:$1g E.done=true L.done=true W.done=true
+  [inv] exit=3 DEADLOCK eStampAtEnqueue=0/0_(asIfRunning_ctx_id=1) eStampAfterHost=0/0 eRanOnThread1=true
+    | T10 thread1=og.worker-2-t10-1 id=1 awaited=W awaitedCausality=2 syncDepth=4
+    | T10 W stamp=1/2 on tid=1
+    | T10 E stamp in asIfRunning after enqueue: 0/0 (asIfRunning ctx id=1); after host returned: 0/0; at run: ranOn=og.worker-2-t10-1 tid=1 stamp=1/2 ecCausality=2 syncDepth=4
+    | T10 at end: thread1.awaited=L parked=true syncStack= > [start]:SRCi:$1g > [start]:SRCi:$1g > Root > L > E E.done=false L.done=false W.done=true
+  [inv-fresh] exit=3 DEADLOCK eStampAtEnqueue=0/0_(emulated_ctx_id=30001) eStampAfterHost=0/0 eRanOnThread1=true
+    | T10 thread1=og.worker-2-t10-1 id=1 awaited=W awaitedCausality=2 syncDepth=4
+    | T10 W stamp=1/2 on tid=1
+    | T10 E stamp in asIfRunning after enqueue: 0/0 (emulated ctx id=30001); after host returned: 0/0; at run: ranOn=og.worker-2-t10-1 tid=1 stamp=1/2 ecCausality=2 syncDepth=4
+    | T10 at end: thread1.awaited=L parked=true syncStack= > [start]:SRCi:$1g > [start]:SRCi:$1g > Root > L > E E.done=false L.done=false W.done=true
+  asIfRunning stamped id 1 on an enqueued node: false; deadlock with id 1: true, with fresh id 30001: true (id-dependent: false)
+RESULT T11 QUANTIFIED 
+  [completer hands off 0 us after the client sets parked] exit=0 handoffs=180000; isolated medians: toString cheap 0.125 us, expensive (20 args, 333 chars) 0.500 us; new Exception at stack depth 5 0.292 us, at depth 205 2.750 us
+    cheap-d0        median blocking sync get 3.13 us (rep0 3.04 us); toString + new Exception = 0.42 us = 13% of it
+    expensive-d0    median blocking sync get 3.67 us (rep0 4.04 us); toString + new Exception = 0.79 us = 22% of it
+    cheap-d200      median blocking sync get 6.83 us (rep0 6.92 us); toString + new Exception = 2.88 us = 42% of it
+    expensive-d200  median blocking sync get 7.46 us (rep0 7.58 us); toString + new Exception = 3.25 us = 44% of it
+    end to end: expensive node at depth 200 minus cheap node at depth 0 = +4.33 us per blocking wait
+  [completer hands off 50 us after the client sets parked] exit=0 handoffs=180000; isolated medians: toString cheap 0.209 us, expensive (20 args, 333 chars) 0.542 us; new Exception at stack depth 5 0.292 us, at depth 205 3.250 us
+    cheap-d0        median blocking sync get 63.63 us (rep0 64.25 us); toString + new Exception = 0.50 us = 1% of it
+    expensive-d0    median blocking sync get 61.79 us (rep0 62.04 us); toString + new Exception = 0.83 us = 1% of it
+    cheap-d200      median blocking sync get 62.46 us (rep0 63.21 us); toString + new Exception = 3.46 us = 6% of it
+    expensive-d200  median blocking sync get 66.13 us (rep0 62.46 us); toString + new Exception = 3.79 us = 6% of it
+    end to end: expensive node at depth 200 minus cheap node at depth 0 = +2.50 us per blocking wait
+RESULT T12 QUANTIFIED 
+  [client runs the 5 s busy node, ideal=4] exit=0 busy=5000ms ranOn=t12-client samples(100ms)=49 cpu (thread=cpuSeconds/samples>=80%): t12-client(busy-node)=4.93s/hot48/per100ms_p10_med_p90=99%,102%,104%;og.worker-1-3=4.17s/hot33/per100ms_p10_med_p90=71%,91%,98%; other threads >=80% CPU for the duration: 0
+  [worker runs the 5 s busy node, ideal=4] exit=0 busy=5000ms ranOn=og.worker-1-2 samples(100ms)=50 cpu (thread=cpuSeconds/samples>=80%): og.worker-1-2(busy-node)=4.93s/hot49/per100ms_p10_med_p90=98%,100%,103%;og.worker-1-3=3.31s/hot0/per100ms_p10_med_p90=57%,68%,75%; other threads >=80% CPU for the duration: 0
+==== summary
+T3: QUANTIFIED
+T4: DEMONSTRATED
+T5: QUANTIFIED
+T6: DEMONSTRATED
+T9: DEMONSTRATED
+T10: NOT_REPRODUCED
+T11: QUANTIFIED
+T12: QUANTIFIED
+==== child commands (PROBES_JAVA_CMD from run-tier1b.sh --print-cmd)
+[t3 vol] java -Doptimus.gthread.ideal=1 <PROBES_JAVA_CMD...> --child t3 vol
+[t3 delay] java -Doptimus.gthread.ideal=1 -Dprobes.delay.maxNanos=50000 <PROBES_JAVA_CMD...> --child t3 delay
+[t3 delay-asserts] java -Doptimus.gthread.ideal=1 -Dprobes.delay.maxNanos=50000 -Doptimus.scheduler.asserts=true <PROBES_JAVA_CMD...> --child t3 delay-asserts
+[t3 vol-ideal2] java -Doptimus.gthread.ideal=2 <PROBES_JAVA_CMD...> --child t3 vol-ideal2
+[t4 0:20:50:solo] java -Doptimus.graph.keepTaskSchedulerAffinity=true  <PROBES_JAVA_CMD...> --child t4 0:20:50:solo
+[t4 50:3:3] java -Doptimus.graph.keepTaskSchedulerAffinity=true  <PROBES_JAVA_CMD...> --child t4 50:3:3
+[t4 0:20:300] java -Doptimus.graph.keepTaskSchedulerAffinity=true  <PROBES_JAVA_CMD...> --child t4 0:20:300
+[t4 0:20:300] java -Doptimus.graph.keepTaskSchedulerAffinity=true -Doptimus.scheduler.asserts=true <PROBES_JAVA_CMD...> --child t4 0:20:300
+[t5 busy] java  <PROBES_JAVA_CMD...> --child t5 busy
+[t5 chain:100000] java  <PROBES_JAVA_CMD...> --child t5 chain:100000
+[t5 busy] java -XX:-UseOnStackReplacement -Xcomp <PROBES_JAVA_CMD...> --child t5 busy
+[t5 chain:100000] java -XX:-UseOnStackReplacement -Xcomp <PROBES_JAVA_CMD...> --child t5 chain:100000
+[t6 nonudge] java -Doptimus.scheduler.asserts=false <PROBES_JAVA_CMD...> --child t6 nonudge
+[t6 nudge] java -Doptimus.scheduler.asserts=false <PROBES_JAVA_CMD...> --child t6 nudge
+[t6 nonudge] java -Doptimus.scheduler.asserts=true <PROBES_JAVA_CMD...> --child t6 nonudge
+[t6 nudge] java -Doptimus.scheduler.asserts=true <PROBES_JAVA_CMD...> --child t6 nudge
+[t9 10000] java -Xss512k -Xmx256m <PROBES_JAVA_CMD...> --child t9 10000
+[t9 10000] java -Xss512k -Xmx256m -Doptimus.gthread.ideal=2 <PROBES_JAVA_CMD...> --child t9 10000
+[t9 15000] java -Xss512k -Xmx256m -Doptimus.gthread.ideal=2 <PROBES_JAVA_CMD...> --child t9 15000
+[t10 stamp] java -Doptimus.gthread.ideal=2 <PROBES_JAVA_CMD...> --child t10 stamp
+[t10 inv] java -Doptimus.gthread.ideal=2 <PROBES_JAVA_CMD...> --child t10 inv
+[t10 inv-fresh] java -Doptimus.gthread.ideal=2 <PROBES_JAVA_CMD...> --child t10 inv-fresh
+[t11 bench] java -Doptimus.gthread.ideal=2 -Dt11.delayUs=0 <PROBES_JAVA_CMD...> --child t11 bench
+[t11 bench] java -Doptimus.gthread.ideal=2 -Dt11.delayUs=50 <PROBES_JAVA_CMD...> --child t11 bench
+[t12 client] java -Doptimus.gthread.ideal=4 <PROBES_JAVA_CMD...> --child t12 client
+[t12 worker] java -Doptimus.gthread.ideal=4 <PROBES_JAVA_CMD...> --child t12 worker
