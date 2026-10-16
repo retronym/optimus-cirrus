@@ -156,6 +156,8 @@ A 24 h run of H3 scenarios in a loop on a 4-core box with `threadCounter` and `_
 - P3 delay injection: done (ASM agent, `probes/src/probes/DelayAgent.java`, armed per thread via `Delay.arm(ctl, ids...)`, or random parks via `-Dprobes.delay.maxNanos=N` for hunter runs). W1c–e run: W1c and W1e demonstrated (stale returns), W1d not reproduced (resurrection noted). Tier 0 complete.
 - Tier 1 T1, T2, T7, T8: done (`probes/run-tier1.sh`, `probes/RESULTS-tier1.txt`). All four demonstrated; T1 is a permanent hang, T7 and T8 end in a surviving JVM or a hang instead of the predicted exit because `InfoDumper` cannot initialise here (F1b, F2b). Next: H1/H2 (jcstress/Lincheck on WorkQueue and the waiter list), then H3 with `-Dprobes.delay.maxNanos`, then T3–T6, T9–T12.
 - H1/H2 model checking: done (`probes/modelcheck/`). WorkQueue: no loss anywhere, R7 double hand-outs quantified. Waiters: protocol holds. New R8 from H2e: `markAsRunnable` vs `complete` leaves a done node runnable (forbidden 2% of samples). Lincheck cannot instrument the agent-rewritten `NodeTask`.
+- H3/H5 fuzzer: done (`probes/run-hunter.sh`, `probes/RESULTS-hunter.txt`). 632 runs, no lost wakeup, no accounting violation, no wrong value. Two new high findings with deterministic reproducers: R9 (stale causality stamp lets a thread deadlock on its own sync stack) and R10 (`limitThreads` starvation of global work no waiter may take, organic triggers). Seed 20 NOT_DONE is open.
+- Remaining: T3–T6, T9–T12, H4 (causality oracle, now partly covered by R9/R10 dumps), H6–H10. Fix candidates worth prototyping first: R9, R10, R1, R8, F1b/F2b.
 
 ## Open questions
 
