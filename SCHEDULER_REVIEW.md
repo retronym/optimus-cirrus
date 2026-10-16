@@ -27,7 +27,7 @@ sequenceDiagram
     S->>Q: push N (nobody waiting may take it)
     Note over T,Q: all threads on sync stacks, N off every forward chain (fan-in shape)
     T->>T: fullWait: 1 s timer walks the chain, N is not on it
-    Note over T,Q: idle workers stay parked (limitThreads); permanent hang
+    Note over T,Q: idle workers stay parked (limitThreads), permanent hang
 ```
 
 Tier 1 probe T1 ran the real scheduler with `threadCounter` primed to 32,768 and 65,530. Every re-enqueue from a causality > 0 frame is then refused by its own thread (100% vs 0–1% at baseline) and lands on the global queue. Shapes where the refused node stays on the waiting thread's forward chain still finish at baseline speed, because `wait()`'s chain walk hands it back. A shape where it does not (a sync node whose fan-in awaiter registers on all children, so siblings are off the chain) hangs permanently: runnable nodes sit in the global quick queue, every thread is in `waitThreads`, `workThreads` is empty, idle workers stay parked, and the 1 s deadlock timer never recovers it because it only walks forward chains. `ideal=1` hangs every time; `ideal=2` with 4 clients hangs in 1–3 of 3 runs. So this is not timer-paced slowness but a deadlock, reached by nothing more than enough threads having initialised an `EvaluationContext` over the process lifetime.
@@ -48,7 +48,7 @@ sequenceDiagram
     Note over Q: 6th push: _top == MAX_VALUE → resetBounds: _top &= mask (63), _base &= mask
     F->>Q: localPop(marker = MAX_VALUE − 6)
     Q-->>F: null   (topLimit > top − 1 for every future _top)
-    Note over F,Q: owner fenced off its own queue for the rest of the frame;<br/>children run only via thieves or the 1 s timer (ideal=1: hang)
+    Note over F,Q: owner fenced off its own queue for the rest of the frame,<br/>children run only via thieves or the 1 s timer (ideal=1: hang)
 ```
 
 Tier 1 probe T2 confirms it on the real scheduler: with the thread's local queue primed at `MAX_VALUE - 10`, a root that enqueues four fan-outs and `runAndWait`s them captures a marker of `MAX_VALUE - 6`, the sixth push fires the reset (`top=257 base=53`), and the owner is fenced off its own 200 tasks. With `ideal=1` the run hangs (1 of 800 leaves run before the 20 s watchdog); with `ideal=2` it completes in normal time but the owner runs 1 of 800 leaves instead of 200, a thief does the rest.
@@ -100,7 +100,7 @@ sequenceDiagram
     W--xW: thread unwinds and dies, no finally removes its Context
     Note over S: _workers still lists the dead worker (count 1)
     C->>S: fullWait timer: "_onStalledCallbacks non-empty and _workers.count == 0"? → false
-    Note over C: never woken; stalled-callback recovery never runs; permanent hang
+    Note over C: never woken, stalled-callback recovery never runs, permanent hang
 ```
 
 Found by T8. When `panic` (and therefore `InfoDumper.graphPanic`) throws instead of exiting, the `OGLogicalThread` unwinds and the platform thread ends, but its `Context` is never removed from `_workers`. The status dump afterwards shows `workThreads 1 [og.worker-1-3]` for a thread that no longer exists, so `_workers.count` never reaches 0, the stalled-callback recovery in `fullWait` never fires, and the client parks forever. Same root cause as F1b: the kill paths assume `graphPanic` cannot throw. `OGLogicalThread.run` should remove its context (an `exitGraph`-style cleanup in a `finally`) before the thread dies, and the last resort after a failed `graphPanic` should be `Runtime.halt`.
