@@ -327,7 +327,7 @@ sequenceDiagram
     N->>T: frame.onChildCompleted(eqW, N)   (synchronous, on W)
     T->>S: awakeOnComplete(N, ctxT)   [SyncFrame → scheduler]
     S->>S: ctx.awaitedTask == N ? tryWakeupThread: _waiters → _workers,<br/>parked = false, unpark(T.thread)
-    T->>T: fullWait returns ctx.awaitedTask; loop sees N.isDoneEx()
+    T->>T: fullWait returns ctx.awaitedTask, loop sees N.isDoneEx()
     T->>T: finally: restore causality/marker, waitingOn = null, pop frame,<br/>exitGraph if the stack is empty
 ```
 
@@ -344,7 +344,7 @@ sequenceDiagram
     S->>S: for each waiter ctx: canTake(Z, ctx.threadID, ctx.awaitedCausalityID)?
     Note over S: depth d ≤ d₀ and same thread id → true
     S->>T: wakeupThread: ctx.awaitedTask = Z, parked = false, unpark
-    T->>T: fullWait returns Z; drainQueue(Z) runs Z inside the frame waiting on S'
+    T->>T: fullWait returns Z, drainQueue(Z) runs Z inside the frame waiting on S'
     T->>T: Z's continuation: runAndWait(S') … S' is suspended lower on T's own stack
     Note over T: parks on S'. No waitingOn cycle, nothing runnable: permanent.
 ```
@@ -409,12 +409,12 @@ sequenceDiagram
     participant IO as remote service
 
     C->>S: wait(R): findWork(…, desperateSearchUnderLock = true)
-    S->>S: nothing on any queue; isStalling(ctx) → _workers.count == 1
+    S->>S: nothing on any queue, isStalling(ctx) → _workers.count == 1
     S->>B: checkForNewWork(scheduler)   (every listener, for-each over the PriorityQueue)
-    S->>B: onGraphStalled(scheduler, outstanding)   (highest priority first; deregistered when called)
+    S->>B: onGraphStalled(scheduler, outstanding)   (highest priority first, deregistered when called)
     B->>IO: send the batch of N deferred node requests
     B->>S: later, from an IO thread: node.complete(…) / scheduler.enqueue(…)
-    S->>S: newWorkAdded? re-scan _qqueue / _queue; else next priority
+    S->>S: newWorkAdded? re-scan _qqueue / _queue, else next priority
     S->>S: still nothing and _workers.count == 1: detectCycles over waiters and tracked nodes
     S-->>C: null → fullWait: park. 1 s timer re-checks "callbacks pending and no workers"
 ```

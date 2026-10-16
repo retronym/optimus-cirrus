@@ -21,7 +21,7 @@ sequenceDiagram
     participant S as OGScheduler
     participant Q as global quick queue
     T->>T: run(N): N.setCausality(1, T) → packed as (T << 16) | 1, sign bit set
-    T->>T: N suspends on a child; child completes elsewhere → N.onChildCompleted
+    T->>T: N suspends on a child, child completes elsewhere → N.onChildCompleted
     T->>S: enqueue(N) from the completer (causality > 0 path)
     S->>S: canTake(N, T, 1): N.causalityThreadID() = (T<<16)>>16 = T − 65536 ≠ T → false for its own owner
     S->>Q: push N (nobody waiting may take it)
@@ -97,7 +97,7 @@ sequenceDiagram
     participant C as client (parked waiter)
     W->>S: findWork → runOnStalledCallbacks → CME from checkForNewWork loop
     W->>W: OGLogicalThread.run catch → panic(66) → graphPanic throws
-    W--xW: thread unwinds and dies; no finally removes its Context
+    W--xW: thread unwinds and dies, no finally removes its Context
     Note over S: _workers still lists the dead worker (count 1)
     C->>S: fullWait timer: "_onStalledCallbacks non-empty and _workers.count == 0"? → false
     Note over C: never woken; stalled-callback recovery never runs; permanent hang
@@ -290,7 +290,7 @@ sequenceDiagram
     B->>P: complete(): tryUpdateState(DONE)  → STARTED|NOT_RUNNABLE|DONE_FLAG
     A->>P: updateState(0, NOT_RUNNABLE)  (unconditional CAS loop) → STARTED|DONE_FLAG
     Note over P: isDone() false, isDoneEx() true, isRunnable() true
-    A->>P: eq.enqueue(parent); later tryRun() wins → run() executes a second time
+    A->>P: eq.enqueue(parent), later tryRun() wins → run() executes a second time
     P->>P: second completion → "Cannot complete node twice!" → logAndDie
 ```
 
@@ -322,9 +322,9 @@ sequenceDiagram
     participant X as non-graph thread
     participant S as OGScheduler.enqueue
     T->>T: runAndWait(R) → runAndWait(A) → runAndWait(Q): depth 2
-    T->>Z: Q enqueues Z; T runs Z in that frame: Z stamped (T, 2); Z registers on promise P1
-    T->>T: A and Q complete; frames pop; depth back to 1
-    T->>T: R: runAndWait(S); S: runAndWait(P2): T parks at depth 2 awaiting P2
+    T->>Z: Q enqueues Z, T runs Z in that frame: Z stamped (T, 2), Z registers on promise P1
+    T->>T: A and Q complete, frames pop, depth back to 1
+    T->>T: R: runAndWait(S), S: runAndWait(P2): T parks at depth 2 awaiting P2
     X->>Z: P1.complete(scheduler) → Z.onChildCompleted → markAsRunnable
     X->>S: enqueue(Z)
     S->>S: waiter T: canTake(Z=(T,2), T, 2) → true (same thread, same depth, different frame)
@@ -374,9 +374,9 @@ sequenceDiagram
     participant I as InfoDumper.graphPanic
     N->>N: second completion detected: tryUpdateState saw DONE
     N->>L: logAndDie(e)
-    L->>L: inLogAndDie = true; log; dump graph state
+    L->>L: inLogAndDie = true, log, dump graph state
     L->>I: graphPanic(…, 121, …)
-    I--xL: throws (here: <clinit> needs utils.conf; in prod: any crumb/dump failure)
+    I--xL: throws (here: <clinit> needs utils.conf, in prod: any crumb/dump failure)
     L--xN: exception escapes logAndDie
     N->>L: catch (Throwable) → logAndDie(e) again
     L-->>N: inLogAndDie already true → "called recursively!" → return
